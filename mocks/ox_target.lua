@@ -335,7 +335,7 @@ return function(emu, opts)
                     reasons[#reasons + 1] = ('zone %d : hors de portée du rayon (%.1f m)'):format(id, distance)
                 else
                     for _, option in ipairs(zone.options) do
-                        local r = try(option, zone, distance, coords)
+                        local r = try(option, zone, distance, coords, o.entity or 0)
                         if r then return true, r end
                     end
                 end

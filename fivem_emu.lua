@@ -1432,6 +1432,12 @@ function Emu:currentPlayer(side)
     return side and side.player
 end
 
+-- Environnement (globales + natives) d'une ressource, côté serveur (target = nil) ou chez un joueur.
+-- Sert dans les tests à agir « depuis » une ressource : emu:env(p, 'ma_ressource').TriggerServerEvent('x')
+function Emu:env(target, resource)
+    return self:_env(target and target.side or self.server, resource)
+end
+
 -------------------------------------------------------------------------------
 -- Rapport
 -------------------------------------------------------------------------------
@@ -1541,7 +1547,9 @@ function Emu:_installDefaultProviders()
         function lib.callback.register(name, fn)
             env.RegisterNetEvent(cbEvent .. name, function(key, ...)
                 local src = env.source
-                local r = table.pack(pcall(fn, side.kind == 'server' and src or nil, ...))
+                -- côté serveur le rappel reçoit (source, ...), côté client seulement (...)
+                local r
+                if side.kind == 'server' then r = table.pack(pcall(fn, src, ...)) else r = table.pack(pcall(fn, ...)) end
                 if not r[1] then
                     emu:_error(side, ('lib.callback « %s » : %s'):format(name, tostring(r[2])))
                     r = { n = 1 }
