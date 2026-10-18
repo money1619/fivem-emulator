@@ -177,7 +177,8 @@ local p = emu:addPlayer({ inventory = { water = 2 } })   -- sans ESX ; avec ESX 
 - Comme ox_inventory : objets empilables par défaut, empilement seulement si les métadonnées sont identiques (`table.matches`), `AddItem` ne contrôle pas le poids (c'est le rôle de `CanCarryItem`), comparaison partielle avec `table.contains` d'ox_lib (qui compare les **valeurs**). 50 emplacements et 30 000 de poids par défaut (`slots`, `maxWeight`).
 - Côté client : copie de l'inventaire tenue à jour par `ox_inventory:updateSlots` ; exports client `Search`, `GetItemCount`, `GetPlayerItems`, `GetPlayerWeight`, `Items`.
 - Aides : `inv.Inventory` (module serveur), `inv:count(p, nom)`, `inv:clientCount(p, nom)`, `inv:inventory(p)`, `inv:swap(p, { fromInventory, fromSlot, toInventory, toSlot, count })` (glisser-déposer simplifié qui passe par le crochet `swapItems`).
-- Non simulé : armes, conteneurs, usure dans le temps, boutiques, fouilles, dépôts au sol, sauvegarde en base.
+- Boutiques : export `RegisterShop(type, { name, inventory = { { name, price, metadata, currency } }, locations })` et aide `inv:buy(p, type, rangArticle, nombre, rangEmplacement)`, qui contrôle comme ox_inventory la distance (10 m si la boutique a des emplacements), l'argent (objet `currency`, « money » par défaut) et la place, puis déclenche les crochets `buyItem` et `createItem`. Renvoie `true` ou `false, raison` (`too_far`, `not_enough_money`, `cannot_carry`, `hook`…). Pas d'interface de boutique ni de prix aléatoires.
+- Non simulé : armes, conteneurs, usure dans le temps, fouilles, dépôts au sol, sauvegarde en base.
 
 ### ox_target 1.18.0 (client) — `mocks/ox_target.lua`
 

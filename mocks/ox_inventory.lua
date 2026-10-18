@@ -43,7 +43,7 @@ local function clone(t) local r = {} for k, v in pairs(t) do r[k] = v end return
 
 return function(emu, opts)
     opts = opts or {}
-    local mock = { hooks = {}, inventories = {}, stashes = {} }
+    local mock = { hooks = {}, inventories = {}, stashes = {}, shops = {} }
     emu.mocks.ox_inventory = mock
     local shared = { playerslots = opts.slots or 50, playerweight = opts.maxWeight or 30000 }
     local env -- environnement serveur de la ressource ox_inventory (natives)
@@ -758,6 +758,8 @@ return function(emu, opts)
                 GetItemCount = Inventory.GetItemCount, ClearInventory = Inventory.Clear, RemoveInventory = Inventory.Remove,
                 RegisterStash = registerStash, setPlayerInventory = mock.setPlayerInventory,
                 registerHook = registerHook,
+                -- Boutiques : RegisterShop(type, { name, inventory = { { name, price, metadata, currency } }, locations })
+                RegisterShop = function(shopType, def) mock.shops[shopType] = emu.netCopy(def) end,
                 removeHooks = function(id) removeResourceHooks(env.GetInvokingResource() or emu:callerResource(emu.server), id) end,
             }
             for name, fn in pairs(exports) do env.exports(name, fn) end
@@ -842,6 +844,37 @@ return function(emu, opts)
     end
     -- Déplacement d'objets comme le glisser-déposer de l'interface (rappel ox_inventory:swapItems, simplifié) :
     -- data = { fromInventory, fromSlot, toInventory, toSlot, count } ; renvoie true ou false (+ raison)
+    -- Achat simulé comme ox_inventory:buyItem : distance (10 m) si la boutique a des emplacements, argent (objet
+    -- `currency`, « money » par défaut), place dans l'inventaire, crochet buyItem, puis AddItem (crochet createItem).
+    -- index = rang de l'article dans def.inventory ; shopId = rang de l'emplacement. Renvoie true ou false, raison.
+    function mock:buy(player, shopType, index, count, shopId)
+        count = count or 1
+        local shop = mock.shops[shopType]
+        if not shop then return false, 'unknown_shop' end
+        local src = id(player)
+        if shop.locations then
+            local loc = shopId and shop.locations[shopId]
+            if not loc then return false, 'no_location' end
+            local p = emu.players[src]
+            local dx, dy, dz = p.pos.x - loc.x, p.pos.y - loc.y, p.pos.z - loc.z
+            if math.sqrt(dx * dx + dy * dy + dz * dz) > 10 then return false, 'too_far' end
+        end
+        local article = shop.inventory[index]
+        if not article then return false, 'unknown_item' end
+        local currency = article.currency or 'money'
+        local price = (article.price or 0) * count
+        if Inventory.GetItemCount(src, currency) < price then return false, 'not_enough_' .. currency end
+        if not Inventory.CanCarryItem(src, article.name, count, article.metadata) then return false, 'cannot_carry' end
+        local metadata = article.metadata and emu.netCopy(article.metadata) or nil
+        if not TriggerEventHooks('buyItem', { source = src, shopType = shopType, shopId = shopId, toInventory = src,
+            itemName = article.name, metadata = metadata, count = count, price = article.price, totalPrice = price,
+            currency = currency }) then return false, 'hook' end
+        if price > 0 and not Inventory.RemoveItem(src, currency, price) then return false, 'payment' end
+        local ok, response = Inventory.AddItem(src, article.name, count, metadata)
+        if not ok then return false, response end
+        return true
+    end
+
     function mock:swap(player, data)
         local from = Inventory(data.fromInventory or player.id)
         local to = Inventory(data.toInventory or player.id)

@@ -718,5 +718,39 @@ do
     T:eq(#emu.errors, 0, 'aucune erreur', emu.errors[1])
 end
 
+T:section('Mock ox_inventory : boutiques (RegisterShop et achat)')
+do
+    local emu = Emu.new()
+    local inv = require('mocks.ox_inventory')(emu, { items = { pain = { label = 'Pain', weight = 100 } } })
+    emu:defineResource('boutique', { server = function(env)
+        env.exports.ox_inventory:RegisterShop('epicerie', {
+            name = 'Épicerie',
+            inventory = { { name = 'pain', price = 30, metadata = { label = 'Pain frais' } } },
+            locations = { env.vector3(10.0, 0.0, 30.0) },
+        })
+        env.exports.ox_inventory:registerHook('createItem', function(payload)
+            local meta = payload.metadata or {}
+            meta.serie = 'S1'
+            return meta
+        end, { itemFilter = { pain = true } })
+    end })
+    emu:start('boutique')
+    local p = emu:addPlayer({ pos = { x = 12.0, y = 0.0, z = 30.0 }, inventory = { money = 50 } })
+    emu:run(100)
+    local ok, why = inv:buy(p, 'epicerie', 1, 1, 1)
+    T:check(ok, 'achat réussi près du point de vente', why)
+    T:eq(inv:count(p, 'money'), 20, 'prix débité')
+    local slot = inv:inventory(p).items[next(inv:inventory(p).items)]
+    local found
+    for _, it in pairs(inv:inventory(p).items) do if it.name == 'pain' then found = it end end
+    T:check(found and found.metadata.serie == 'S1' and found.metadata.label == 'Pain frais', 'métadonnées de la boutique + crochet createItem')
+    local ok2, why2 = inv:buy(p, 'epicerie', 1, 1, 1)
+    T:check(not ok2 and why2 == 'not_enough_money', 'argent insuffisant refusé')
+    p:setPosition(200.0, 0.0, 30.0)
+    local ok3, why3 = inv:buy(p, 'epicerie', 1, 1, 1)
+    T:check(not ok3 and why3 == 'too_far', 'trop loin du point de vente refusé')
+    T:eq(#emu.errors, 0, 'aucune erreur', emu.errors[1])
+end
+
 local allOk = T:summary()
 os.exit(allOk and 0 or 1)
