@@ -1,0 +1,13 @@
+fx_version 'cerulean'
+game 'gta5'
+lua54 'yes'
+
+description 'Ressource de démonstration pour fivem_emu'
+
+shared_scripts {
+    '@ox_lib/init.lua',
+    'config.lua',
+}
+
+server_scripts { 'server/*.lua' }
+client_scripts { 'client/*.lua' }
