@@ -303,6 +303,13 @@ do
     T:eq(Emu.joaat('ADDER'), -1216765807, 'joaat ignore la casse')
     T:eq(Emu.preprocess('x += 1'), 'x = x + (1)', 'préprocesseur : x += 1')
     T:eq(Emu.preprocess('self.n -= a * 2 -- note'), 'self.n = self.n - (a * 2) -- note', 'préprocesseur : champ et commentaire final')
+    -- Les accents graves ne sont convertis que dans le code, jamais dans une chaîne ou un commentaire (comme CfxLua)
+    T:eq(Emu.preprocess("local q = 'SET `wins` = 1'"), "local q = 'SET `wins` = 1'", 'préprocesseur : `x` laissé dans une chaîne')
+    T:eq(Emu.preprocess('local q = "a `b` c"'), 'local q = "a `b` c"', 'préprocesseur : `x` laissé dans une chaîne entre guillemets')
+    T:eq(Emu.preprocess("local q = [[ `x` ]] local h = `adder`"), "local q = [[ `x` ]] local h = -1216765807", 'préprocesseur : chaîne longue ignorée, hash après')
+    T:eq(Emu.preprocess("-- note `x`\nlocal h = `adder`"), "-- note `x`\nlocal h = -1216765807", 'préprocesseur : commentaire ignoré')
+    T:eq(Emu.preprocess("--[[ bloc `x` ]] x = `adder`"), "--[[ bloc `x` ]] x = -1216765807", 'préprocesseur : commentaire long ignoré')
+    T:eq(Emu.preprocess("local s = 'it\\'s `a`' .. `adder`"), "local s = 'it\\'s `a`' .. -1216765807", 'préprocesseur : apostrophe échappée dans une chaîne')
     T:eq(Emu.preprocess('if ok then t[k] *= 2 else t[k] /= 2 end'), 'if ok then t[k] = t[k] * (2) else t[k] = t[k] / (2) end',
         'préprocesseur : sur une ligne avec if/else/end')
     T:eq(Emu.preprocess('local s = "a += b"'), 'local s = "a += b"', 'préprocesseur : chaînes non touchées')

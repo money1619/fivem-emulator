@@ -370,8 +370,56 @@ local function convertCompound(code)
     return code
 end
 
+-- `nom` → hash, seulement dans le code : jamais dans une chaîne ('…', "…", [[…]]) ni un commentaire
+local function replaceHashes(src)
+    local out, i, n = {}, 1, #src
+    while i <= n do
+        local c = src:sub(i, i)
+        if c == '-' and src:sub(i, i + 1) == '--' then
+            local level = src:match('^%-%-%[(=*)%[', i)
+            local stop
+            if level then
+                stop = select(2, src:find(']' .. level .. ']', i, true)) or n
+            else
+                stop = (src:find('\n', i, true) or n + 1) - 1
+            end
+            out[#out + 1] = src:sub(i, stop)
+            i = stop + 1
+        elseif c == '[' and src:match('^%[=*%[', i) then
+            local level = src:match('^%[(=*)%[', i)
+            local stop = select(2, src:find(']' .. level .. ']', i, true)) or n
+            out[#out + 1] = src:sub(i, stop)
+            i = stop + 1
+        elseif c == '"' or c == "'" then
+            local j = i + 1
+            while j <= n do
+                local d = src:sub(j, j)
+                if d == '\\' then j = j + 2
+                elseif d == c or d == '\n' then break
+                else j = j + 1 end
+            end
+            out[#out + 1] = src:sub(i, j)
+            i = j + 1
+        elseif c == '`' then
+            local stop = src:find('[`\n]', i + 1)
+            if stop and src:sub(stop, stop) == '`' then
+                out[#out + 1] = tostring(joaat(src:sub(i + 1, stop - 1)))
+                i = stop + 1
+            else
+                out[#out + 1] = c
+                i = i + 1
+            end
+        else
+            local j = src:find('[%-%[\'"`]', i + 1) or n + 1
+            out[#out + 1] = src:sub(i, j - 1)
+            i = j
+        end
+    end
+    return table.concat(out)
+end
+
 local function preprocess(src)
-    src = src:gsub('`([^`\n]*)`', function(name) return tostring(joaat(name)) end)
+    src = replaceHashes(src)
     local out = {}
     for line in (src .. '\n'):gmatch('(.-)\n') do
         if line:find('[%+%-%*/&|%^<>]=') then
