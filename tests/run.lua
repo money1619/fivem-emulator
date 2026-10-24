@@ -999,5 +999,67 @@ do
     T:eq(#emu.errors, 0, 'erreurs provoquées par l\'audit gardées hors de emu.errors', emu.errors[1])
 end
 
+-------------------------------------------------------------------------------
+T:section('Audit : actions en deux temps (chains), remise à zéro (reset), ids voisins')
+-------------------------------------------------------------------------------
+do
+    local function setup(checkDuration)
+        local emu = Emu.new()
+        local esx = require('mocks.esx')(emu)
+        local coffres = { [1] = 'a', [2] = 'b' } -- coffre 1 à Alice, 2 à Bob
+        emu:defineResource('atelier', { server = function(env)
+            local ESX = env.exports.es_extended:getSharedObject()
+            local sessions = {}
+            env.RegisterNetEvent('at:debut', function() sessions[env.source] = env.GetGameTimer() end)
+            env.RegisterNetEvent('at:fin', function()
+                local started = sessions[env.source]
+                sessions[env.source] = nil
+                if not started or (checkDuration and env.GetGameTimer() - started < 2400) then return end
+                ESX.GetPlayerFromId(env.source).addAccountMoney('bank', 50)
+            end)
+            -- vider un coffre : le serveur ne vérifie pas le propriétaire
+            env.RegisterNetEvent('at:vider', function(id)
+                if coffres[id] then
+                    coffres[id] = nil
+                    ESX.GetPlayerFromId(env.source).addAccountMoney('bank', 10)
+                end
+            end)
+        end })
+        emu:start('atelier')
+        local a = emu:addPlayer({ name = 'Alice', esx = { accounts = { bank = 0 } } })
+        local b = emu:addPlayer({ name = 'Bob', esx = { accounts = { bank = 0 } } })
+        esx:waitLoaded(a)
+        esx:waitLoaded(b)
+        local client = emu:env(a, 'atelier')
+        client.TriggerServerEvent('at:debut')
+        emu:run(3000)
+        client.TriggerServerEvent('at:fin')
+        client.TriggerServerEvent('at:vider', 1)
+        emu:run(500)
+        -- sonde : coffres possédés par chaque joueur (a = Alice, b = Bob)
+        emu:addProbe('coffres', function(p)
+            local n = 0
+            for _, owner in pairs(coffres) do if owner == p.name:sub(1, 1):lower() then n = n + 1 end end
+            return { possedes = n }
+        end)
+        local resets = 0
+        local r = emu:fuzz({
+            resources = { 'atelier' },
+            chains = { ['at:debut'] = { 'at:fin' } },
+            reset = function() resets = resets + 1 coffres[1], coffres[2] = 'a', 'b' end,
+        })
+        return r, resets
+    end
+    local function found(r, event, kind)
+        for _, f in ipairs(r.findings) do if f.event == event and f.kind:find(kind, 1, true) then return f end end
+    end
+    local r, resets = setup(false)
+    T:check(found(r, 'at:debut', 'durée non vérifiée'), 'chains : fin envoyée sans attendre = durée non vérifiée', r:text())
+    T:check(found(r, 'at:vider', 'perte pour un autre joueur (argument 1)'), 'id voisin (2) : coffre de Bob vidé par Alice', r:text())
+    T:check(resets == r.attempts, 'reset appelé avant chaque tentative')
+    local r2 = setup(true)
+    T:check(not found(r2, 'at:debut', 'durée'), 'durée vérifiée côté serveur : rien à signaler', r2:text())
+end
+
 local allOk = T:summary()
 os.exit(allOk and 0 or 1)

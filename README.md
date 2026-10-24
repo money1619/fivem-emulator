@@ -153,7 +153,9 @@ T:eq(audit:count('critique'), 0, 'aucune faille critique')
 
 Pour chaque événement réseau serveur de vos ressources (`RegisterNetEvent` et `lib.callback.register`), l'audit reprend les vrais appels observés pendant le test (ou des appels vides si l'événement n'a jamais été déclenché) et les renvoie depuis le joueur, comme le ferait un exécuteur Lua :
 
-- chaque argument, et chaque champ d'un argument table, remplacé par `nil`, `-1`, `0`, `-100000`, `1e9`, `2^31`, `0.5`, `NaN`, `inf`, `''`, une chaîne de 10 Ko, une injection SQL, `{}`, `true`, l'id d'un autre joueur ;
+- chaque argument, et chaque champ d'un argument table, remplacé par `nil`, `-1`, `0`, `-100000`, `1e9`, `2^31`, `0.5`, `NaN`, `inf`, `''`, une chaîne de 10 Ko, une injection SQL, `{}`, `true`, l'id d'un autre joueur, et aussi :
+  - les **valeurs vues dans le trafic observé** (noms d'objets, actions, ids de plants ou de coffres…) : une action `water` devient `burn`, un id devient celui d'un autre objet ;
+  - **`id - 1` et `id + 1`** pour un entier : l'objet d'un autre joueur est-il accessible ?
 - l'appel normal 10 fois en rafale ;
 - l'appel normal depuis 10 km.
 
@@ -161,11 +163,25 @@ Des sondes mesurent l'argent et les objets de chaque joueur avant et après chaq
 
 | Gravité | Signalé quand |
 |---|---|
-| `critique` | le tricheur gagne plus qu'avec l'appel normal (ou obtient la même chose en payant moins), un autre joueur perd quelque chose, une valeur devient `NaN` ou infinie, ou le texte piégé arrive tel quel dans une requête SQL (oxmysql) |
+| `critique` | le tricheur reçoit plus qu'avec l'appel normal sans rien payer (ou obtient la même chose en payant moins), un autre joueur perd quelque chose, une valeur devient `NaN` ou infinie, le texte piégé arrive tel quel dans une requête SQL (oxmysql), ou une action en plusieurs messages donne le même résultat sans attendre sa durée (`chains`) |
 | `attention` | 10 envois rapportent 10 fois (pas d'anti-spam), ou le même gain est obtenu à 10 km (position pas vérifiée) |
 | `info` | une valeur piégée provoque une erreur Lua côté serveur (argument non vérifié) |
 
-`audit.findings` liste `{ severity, event, kind, detail, args }`, `audit:count(gravité)` les compte, `audit:text()` les affiche. Un tricheur expulsé (`DropPlayer`) ou dont l'argent est devenu `NaN` est remplacé par un nouveau joueur identique. Les erreurs Lua provoquées par l'audit sont rangées dans le résultat, pas dans `emu.errors`. Options : `resources`, `events`, `skip`, `player`, `settle` (attente après chaque envoi), `spam` (10), `maxCalls` (2 appels observés par événement).
+`audit.findings` liste `{ severity, event, kind, detail, args }`, `audit:count(gravité)` les compte, `audit:text()` les affiche. Un tricheur expulsé (`DropPlayer`) ou dont l'argent est devenu `NaN` est remplacé par un nouveau joueur identique. Les erreurs Lua provoquées par l'audit sont rangées dans le résultat, pas dans `emu.errors`. Options : `resources`, `events`, `skip`, `player`, `settle` (attente après chaque envoi), `spam` (10), `maxCalls` (2 appels observés par événement), `values` (valeurs à essayer en plus), `seed` (graine de `math.random`, la même à chaque tentative : un écart vient de la variante, pas du hasard).
+
+Un échange contre autre chose (acheter un autre article de la boutique, par exemple) n'est pas compté comme un gain : l'audit ne connaît pas les prix. Le gain doit être gratuit, ou la même chose doit coûter moins cher.
+
+**Actions en plusieurs messages** (`chains`) : beaucoup de scripts demandent l'action (`begin`), jouent une barre de progression, puis valident (`finish`). Déclarez la suite, et l'audit la rejoue avec son délai réel après chaque variante, puis une fois sans attendre :
+
+```lua
+local audit = emu:fuzz({
+    chains = { ['ma_ressource:begin'] = { 'ma_ressource:finish' } },   -- noms d'événements ou de lib.callback
+    reset = function(tricheur) remettreLesPlantsEtLesObjets(tricheur) end,
+    maxCalls = 12,
+})
+```
+
+**État de départ** (`reset`) : chaque tentative consomme quelque chose (le plant récolté n'existe plus, la graine est plantée…). `reset(tricheur)` est appelé avant chaque tentative pour tout remettre comme au début ; sans lui, les tentatives suivantes échouent pour de mauvaises raisons et l'audit ne voit plus rien.
 
 L'audit ne voit que ce que mesurent les sondes : ajoutez les vôtres pour d'autres ressources (`emu:addProbe('xp', function(p) return { xp = monXp[p.id] } end)`). Il ne remplace pas une relecture du code : il trouve vite les oublis classiques.
 
@@ -271,7 +287,7 @@ local ok2, raison = target:select(bob, 'boutique:eau', { coords = { x = 1, y = 2
   ok     Bob déconnecté ne reçoit plus rien
   ok     aucune erreur
 
-fivem_emu 0.3.0 — t = 9.5 s virtuelles, 3 joueur(s)
+fivem_emu 0.3.1 — t = 9.5 s virtuelles, 3 joueur(s)
 erreurs : 0
 TriggerClientEvent vers tous (-1) : 3 fois
 joueur 1 (Alice, RTT 30 ms) : reçu 4 paquets / 0.1 Ko, envoyé 3 / 0.1 Ko, 60 dessins, 0 entités locales restantes
@@ -304,7 +320,7 @@ joueur 3 (Carol, RTT 90 ms) : reçu 5 paquets / 0.2 Ko, envoyé 2 / 0.1 Ko, 30 d
   ok     deux ventes enregistrées
   ok     aucune erreur
 
-fivem_emu 0.3.0 — t = 4.3 s virtuelles, 2 joueur(s)
+fivem_emu 0.3.1 — t = 4.3 s virtuelles, 2 joueur(s)
 erreurs : 0
 joueur 1 (Alice, RTT 40 ms) : reçu 16 paquets / 2.1 Ko, envoyé 5 / 0.3 Ko, 0 dessins, 0 entités locales restantes
 joueur 2 (Bob, RTT 150 ms) : reçu 3 paquets / 0.8 Ko, envoyé 2 / 0.0 Ko, 0 dessins, 0 entités locales restantes
@@ -316,7 +332,7 @@ oxmysql (simulé) : 3 requête(s), 0 sans réponse prévue
 `lua5.4 examples/demo_audit_test.lua` (ressource `examples/resources/demo_faille`, **volontairement mal protégée**) :
 
 ```
-Audit anti-triche : 4 événement(s), 66 tentative(s), 3 critique(s), 2 attention, 1 info
+Audit anti-triche : 4 événement(s), 84 tentative(s), 3 critique(s), 2 attention, 1 info
   CRITIQUE  faille:journal — injection SQL (argument 1) : requête envoyée : INSERT INTO faille_journal (message) VALUES ('emu' OR '1'='1')
   CRITIQUE  faille:virement — gain (argument 2) : valeur -1 → esx:bank +1 (appel normal : -50)
   CRITIQUE  faille:virement — perte pour un autre joueur (argument 2) : valeur -1 → joueur 2 : esx:bank -1 (appel normal : +50)
@@ -330,7 +346,7 @@ L'événement `faille:don`, qui vérifie son montant (entier, positif, plafonné
 `lua5.4 tests/run.lua` lance les tests de l'émulateur et des mocks (ajoutez `-v` pour voir chaque vérification) ; il se termine par :
 
 ```
-265 vérifications : 265 réussies, 0 échouées
+269 vérifications : 269 réussies, 0 échouées
 ```
 
 ## Organisation du dépôt

@@ -9,7 +9,7 @@
 -- apparaissent dans le rapport ; on les ajoute avec emu:native().
 local Emu = {}
 Emu.__index = Emu
-Emu.VERSION = '0.3.0'
+Emu.VERSION = '0.3.1'
 
 local unpack = table.unpack
 
@@ -1739,7 +1739,12 @@ local function fmtNum(x) return math.type(x) == 'integer' and ('%+d'):format(x) 
 
 -- opts : resources = { noms } (par défaut : ressources lues sur disque), events = { noms } (filtre), skip = { noms },
 -- player = joueur tricheur (par défaut : celui qui a envoyé le trafic observé, sinon le premier),
--- settle (ms d'attente après chaque envoi), spam (10 envois en rafale), maxCalls (2 appels observés par événement).
+-- settle (ms d'attente après chaque envoi), spam (10 envois en rafale), maxCalls (2 appels observés par événement),
+-- chains = { evenement = { suites } } : actions en plusieurs messages (ex. lib.callback 'x:begin' puis 'x:finish') ;
+--   la suite observée est rejouée avec son délai réel après chaque variante, et une fois tout de suite (durée vérifiée ?),
+-- reset = fn(joueur) : remet l'état de départ avant chaque tentative (plants, objets…), values = { valeurs } à essayer
+--   en plus. Les chaînes et entiers vus dans le trafic observé (ids, noms d'objets, actions) sont aussi essayés à
+--   chaque position, ainsi que id - 1 et id + 1 pour un entier (accès à l'objet d'un autre joueur).
 -- Renvoie { findings = { { severity, event, kind, detail, args } }, attempts, events } et r:text().
 -- À lancer en fin de test : les tentatives modifient l'état (argent, objets…). Les erreurs Lua provoquées
 -- sont rangées dans le résultat, pas dans emu.errors.
@@ -1791,32 +1796,89 @@ function Emu:fuzz(opts)
         for _, p in ipairs(self.playerList) do if not p.dropped then return p end end
     end
 
-    -- Trafic réel observé : par événement, les premiers appels distincts et leur expéditeur
+    -- Noms d'événements : 'x' ou lib.callback 'x' (enregistré sous __emu_ox_cb:x)
+    local function resolve(n)
+        if self.server.netEvents[n] then return n end
+        return '__emu_ox_cb:' .. n
+    end
+    local chains = {}
+    for from, list in pairs(opts.chains or {}) do
+        local set = {}
+        for _, n in ipairs(type(list) == 'table' and list or { list }) do set[resolve(n)] = true end
+        chains[resolve(from)] = set
+    end
+
+    -- Trafic réel observé : par événement, les premiers appels distincts, leur expéditeur et leur suite (chains)
     local observed = {}
+    local pool, inPool = {}, {}
+    local function collect(v)
+        local t = math.type(v) == 'integer' and 'i' or (type(v) == 'string' and #v <= 64 and #v > 0 and 's') or nil
+        if t and #pool < 40 and not inPool[t .. tostring(v)] then
+            inPool[t .. tostring(v)] = true
+            pool[#pool + 1] = v
+        end
+    end
     for _, p in ipairs(self.playerList) do
-        for _, m in ipairs(p.sentToServer) do
+        local sent = p.sentToServer
+        for j, m in ipairs(sent) do
             if m.args then
+                local isCb = m.name:find('^__emu_ox_cb:') ~= nil
+                for i = isCb and 2 or 1, m.args.n or #m.args do
+                    local v = m.args[i]
+                    collect(v)
+                    if type(v) == 'table' and getmetatable(v) ~= VEC then for _, x in pairs(v) do collect(x) end end
+                end
                 local list = observed[m.name] or {}
                 observed[m.name] = list
                 local key = json.encode(m.args)
                 if #list < (opts.maxCalls or 2) and not list[key] then
                     list[key] = true
-                    list[#list + 1] = { sender = p, args = m.args }
+                    local follow, wanted = {}, chains[m.name]
+                    if wanted then
+                        local got = {}
+                        for k = j + 1, #sent do
+                            local f = sent[k]
+                            if f.name == m.name then break end
+                            if wanted[f.name] and not got[f.name] and f.args then
+                                got[f.name] = true
+                                follow[#follow + 1] = { name = f.name, args = f.args, delay = f.t - m.t }
+                            end
+                        end
+                    end
+                    list[#list + 1] = { sender = p, args = m.args, follow = follow }
                 end
             end
         end
     end
+    for _, v in ipairs(opts.values or {}) do collect(v) end
 
     local function sqlLogSize() return self.mocks.oxmysql and #self.mocks.oxmysql.log or 0 end
 
-    local function attempt(sender, name, args, copies)
+    local function send(sender, name, args)
+        self:_send(sender, 'up', name, args, function(copy) self:_dispatch(self.server, name, copy, sender.id, true) end)
+    end
+
+    -- follow = suite de l'action (chains), envoyée avec son délai observé, ou tout de suite si fast
+    local function attempt(sender, name, args, copies, follow, fast)
+        if opts.reset then
+            opts.reset(sender)
+            self:run(0)
+        end
+        -- même tirage au hasard à chaque tentative : un écart vient de la variante, pas de math.random
+        math.randomseed(opts.seed or 1)
         local before = self:_probeAll()
         local nErr, nWarn, nSql = #self.errors, #self.warnings, sqlLogSize()
+        local last = 0
         for _ = 1, copies or 1 do
-            self:_send(sender, 'up', name, args, function(copy) self:_dispatch(self.server, name, copy, sender.id, true) end)
+            send(sender, name, args)
+            for k, f in ipairs(follow or {}) do
+                local delay = fast and k or f.delay
+                last = math.max(last, delay)
+                self:at(self.now + delay, function() if not sender.dropped then send(sender, f.name, f.args) end end)
+            end
         end
         local settle = opts.settle or ((sender.profile.rtt + (sender.profile.jitter or 0)) * 2 + 500)
-        self:run(settle)
+        self:run(settle + last)
         result.attempts = result.attempts + 1
         local r = { delta = probeDelta(before, self:_probeAll()), errors = {}, dropped = sender.dropped }
         for i = nErr + 1, #self.errors do r.errors[#r.errors + 1] = self.errors[i] end
@@ -1831,12 +1893,23 @@ function Emu:fuzz(opts)
         return r
     end
 
+    -- Appel observé en cours d'audit, affiché sous la forme (a, b, …) sans la clé interne des lib.callback
+    local currentCall
+    local function fmtCall(name, args)
+        if not args then return nil end
+        local parts = {}
+        for i = name:find('^__emu_ox_cb:') and 2 or 1, args.n or #args do parts[#parts + 1] = json.encode(args[i]) end
+        local s = '(' .. table.concat(parts, ', ') .. ')'
+        return #s > 120 and s:sub(1, 117) .. '…)' or s
+    end
+
     local function add(severity, event, kind, detail, args)
-        local key = event .. '|' .. kind
+        local call = fmtCall(event, currentCall)
+        local key = event .. '|' .. kind .. '|' .. tostring(call)
         if seen[key] then return end
         seen[key] = true
         result.findings[#result.findings + 1] = { severity = severity, event = display(event), kind = kind,
-                                                  detail = detail, args = args }
+                                                  detail = detail, args = args, call = call }
     end
 
     local function hasPositive(delta, id)
@@ -1846,18 +1919,21 @@ function Emu:fuzz(opts)
     local function bad(x) return x ~= x or x == math.huge or x == -math.huge end
 
     -- Ce qui change par rapport à l'appel normal :
-    --  gain = le tricheur finit avec plus qu'avant et plus qu'avec l'appel normal (payer moins n'est pas un gain) ;
+    --  gain = le tricheur reçoit plus qu'avant et plus qu'avec l'appel normal, sans rien payer (un échange contre
+    --    autre chose, comme acheter un autre article, n'est pas un gain : les prix ne sont pas connus) ;
     --  moins cher = au moins tout ce que donne l'appel normal, en payant moins ;
     --  perte = un autre joueur finit avec moins qu'avant et moins qu'avec l'appel normal ;
     --  une valeur qui devient NaN ou infinie compte toujours.
     local function compare(sender, r, control)
         local gains, losses = {}, {}
         local mine, ref = r.delta[sender.id] or {}, control.delta[sender.id] or {}
+        local paid = false
+        for _, x in pairs(mine) do if x < 0 then paid = true end end
         for k, x in pairs(mine) do
             local base = ref[k] or 0
             if bad(x) then
                 gains[#gains + 1] = ('%s devient %s (valeur corrompue)'):format(k, tostring(x))
-            elseif x > 0 and x > base then
+            elseif x > 0 and x > base and not paid then
                 gains[#gains + 1] = ('%s %s (appel normal : %s)'):format(k, fmtNum(x), fmtNum(base))
             end
         end
@@ -1935,8 +2011,9 @@ function Emu:fuzz(opts)
         end
         for _, call in ipairs(calls) do
             local sender = ensureAlive(opts.player or call.sender)
-            local base = call.args
-            local control = attempt(sender, name, base)
+            local base, follow = call.args, call.follow or {}
+            currentCall = base
+            local control = attempt(sender, name, base, 1, follow)
             if control.dropped then
                 add('info', name, 'expulsion', 'l\'appel normal expulse déjà le joueur (DropPlayer)', base)
                 sender = ensureAlive(sender)
@@ -1949,6 +2026,13 @@ function Emu:fuzz(opts)
             for i = first, math.max(base.n or #base, ev.arity) do
                 local values = table.move(HOSTILE, 1, #HOSTILE, 1, {})
                 if victim then values[#values + 1] = { label = ('id d\'un autre joueur (%d)'):format(victim.id), value = victim.id } end
+                if math.type(base[i]) == 'integer' then
+                    values[#values + 1] = { label = ('id voisin (%d)'):format(base[i] - 1), value = base[i] - 1 }
+                    values[#values + 1] = { label = ('id voisin (%d)'):format(base[i] + 1), value = base[i] + 1 }
+                end
+                for _, v in ipairs(pool) do
+                    if v ~= base[i] then values[#values + 1] = { label = ('observée %q'):format(v), value = v } end
+                end
                 for _, h in ipairs(values) do
                     local a = netCopy(base)
                     a.n = math.max(a.n or #a, i)
@@ -1971,7 +2055,7 @@ function Emu:fuzz(opts)
             end
 
             for _, v in ipairs(variants) do
-                local r = attempt(sender, name, v.args)
+                local r = attempt(sender, name, v.args, 1, follow)
                 local gains, losses = compare(sender, r, control)
                 local with = ('valeur %s'):format(v.label)
                 if #gains > 0 then
@@ -1989,10 +2073,20 @@ function Emu:fuzz(opts)
                 sender = ensureAlive(sender)
             end
 
+            -- Durée : la suite envoyée tout de suite (barre de progression sautée) donne le même résultat
+            if #follow > 0 and rewarding(control.delta, sender.id) then
+                local r = attempt(sender, name, base, 1, follow, true)
+                if Emu.deepEqual(r.delta, control.delta) then
+                    add('critique', name, 'durée non vérifiée',
+                        'la suite envoyée tout de suite (sans attendre la durée de l\'action) donne le même résultat', base)
+                end
+                sender = ensureAlive(sender)
+            end
+
             -- Rafale : un gain répété à chaque envoi = pas d'anti-spam (cooldown, verrou, état « déjà fait »)
             if hasPositive(control.delta, sender.id) then
                 local n = opts.spam or 10
-                local r = attempt(sender, name, base, n)
+                local r = attempt(sender, name, base, n, follow)
                 local gains = {}
                 for k, x in pairs(r.delta[sender.id] or {}) do
                     local one = (control.delta[sender.id] or {})[k] or 0
@@ -2009,7 +2103,7 @@ function Emu:fuzz(opts)
             if rewarding(control.delta, sender.id) then
                 local pos = sender.pos
                 sender.pos = { x = pos.x + 10000.0, y = pos.y + 10000.0, z = pos.z }
-                local r = attempt(sender, name, base)
+                local r = attempt(sender, name, base, 1, follow)
                 sender.pos = pos
                 if Emu.deepEqual(r.delta, control.delta) then
                     add('attention', name, 'aucun contrôle de distance', 'même effet à 10 km de la position du test', base)
@@ -2035,6 +2129,7 @@ function Emu:fuzz(opts)
             :format(#self.events, self.attempts, self:count('critique'), self:count('attention'), self:count('info')) }
         for _, f in ipairs(self.findings) do
             lines[#lines + 1] = ('  %-9s %s — %s : %s'):format(f.severity:upper(), f.event, f.kind, f.detail)
+            if f.call then lines[#lines + 1] = '            appel observé : ' .. f.call end
         end
         return table.concat(lines, '\n')
     end
