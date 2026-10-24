@@ -273,4 +273,4 @@ tests/run.lua                 tests de l'émulateur et des mocks (ressources de 
 
 ## Licence
 
-Aucune licence n'est encore choisie : le choix revient au propriétaire du dépôt. En attendant, les droits par défaut s'appliquent (pas de réutilisation sans accord).
+Distribué sous licence MIT (voir [LICENSE](LICENSE)) : vous pouvez utiliser, modifier et redistribuer le code, y compris dans un projet commercial, à condition de garder l'avis de copyright et la licence. Le logiciel est fourni tel quel, sans garantie.
