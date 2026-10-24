@@ -752,5 +752,252 @@ do
     T:eq(#emu.errors, 0, 'aucune erreur', emu.errors[1])
 end
 
+-------------------------------------------------------------------------------
+T:section('State bags')
+-------------------------------------------------------------------------------
+do
+    local emu = Emu.new()
+    local seen, order = {}, {}
+    res(emu, 'etat', function(env)
+        env.AddStateBagChangeHandler('argent', nil, function(bag, key, value, _, replicated)
+            seen[#seen + 1] = ('%s %s=%s %s'):format(bag, key, tostring(value), tostring(replicated))
+        end)
+        env.GlobalState.meteo = 'pluie'
+    end, function(env, _, player)
+        env.AddStateBagChangeHandler('meteo', 'global', function(_, _, value)
+            -- appelé avant le changement : l'ancienne valeur est encore lisible
+            order[player.id] = { env.GlobalState.meteo, value }
+        end)
+    end)
+    local a = emu:addPlayer({ rtt = 100 })
+    emu:run(10)
+    local senv, aenv = emu:env(nil, 'etat'), emu:env(a, 'etat')
+    T:eq(aenv.GlobalState.meteo, 'pluie', 'nouveau joueur : reçoit l\'état global déjà présent')
+    senv.GlobalState.meteo = 'soleil'
+    T:eq(senv.GlobalState.meteo, 'soleil', 'serveur : valeur immédiate')
+    T:eq(aenv.GlobalState.meteo, 'pluie', 'client : pas encore reçue (RTT/2 = 50 ms)')
+    emu:run(60)
+    T:eq(aenv.GlobalState.meteo, 'soleil', 'client : valeur répliquée après RTT/2')
+    T:same(order[a.id], { 'pluie', 'soleil' }, 'gestionnaire appelé avant le changement')
+
+    senv.GlobalState.config = { prix = 10 }
+    local copy = senv.GlobalState.config
+    copy.prix = 99
+    T:eq(senv.GlobalState.config.prix, 10, 'lecture = copie : modifier la table lue ne change pas le sac')
+
+    aenv.LocalPlayer.state:set('argent', 500, true)
+    aenv.GlobalState:set('meteo', 'grêle', true)
+    aenv.GlobalState.meteo = 'neige'
+    emu:run(200)
+    T:eq(senv.Player(a.id).state.argent, 500, 'LocalPlayer.state:set(clé, valeur, true) arrive au serveur')
+    T:check(hasText(seen, 'player:1 argent=500 true'), 'gestionnaire serveur appelé pour l\'écriture du client', seen[1])
+    T:eq(senv.GlobalState.meteo, 'soleil', 'client : GlobalState refusé en écriture répliquée')
+    T:check(hasText(emu.warnings, 'écriture refusée dans le state bag global'), 'refus signalé dans emu.warnings')
+    T:eq(aenv.GlobalState.meteo, 'neige', 'client : GlobalState.x = v reste local (comme FiveM)')
+
+    local b = emu:addPlayer()
+    emu:run(10)
+    local benv = emu:env(b, 'etat')
+    T:eq(benv.Player(a.id).state.argent, 500, 'joueur arrivé après : voit le sac répliqué d\'un autre joueur')
+    T:eq(benv.GetPlayerFromStateBagName('player:1'), 0, 'GetPlayerFromStateBagName côté client : index du joueur')
+    T:eq(senv.GetPlayerFromStateBagName('player:1'), 1, 'GetPlayerFromStateBagName côté serveur : id serveur')
+    senv.Entity(4242).state:set('verrou', true, true)
+    emu:run(50)
+    T:eq(benv.Entity(4242).state.verrou, true, 'Entity(ent).state répliqué')
+
+    a:drop()
+    T:eq(next(emu:stateBag('player:1')), nil, 'déconnexion : le sac du joueur disparaît')
+
+    local n = 0
+    local cookie = senv.AddStateBagChangeHandler('', '', function() n = n + 1 end)
+    senv.GlobalState.x = 1
+    senv.RemoveStateBagChangeHandler(cookie)
+    senv.GlobalState.x = 2
+    T:eq(n, 1, 'RemoveStateBagChangeHandler')
+    emu:stop('etat')
+    senv.GlobalState.meteo = 'brouillard'
+    emu:run(50)
+    T:same(order[b.id], nil, 'ressource arrêtée : ses gestionnaires ne sont plus appelés')
+    T:eq(#emu.errors, 0, 'aucune erreur', emu.errors[1])
+end
+
+-------------------------------------------------------------------------------
+T:section('ox_lib : zones, points, addCommand, progression, menus, dialogues')
+-------------------------------------------------------------------------------
+do
+    local emu = Emu.new()
+    local withLib = emu.providers['@ox_lib/init.lua']
+    local log, insideCount, pointNearby = {}, 0, false
+    res(emu, 'oxl', function(env)
+        withLib(env, emu.server, emu)
+        env.lib.addCommand('donner', {
+            restricted = 'group.admin',
+            params = { { name = 'cible', type = 'playerId' }, { name = 'nombre', type = 'number' },
+                       { name = 'note', type = 'longString', optional = true } },
+        }, function(source, args)
+            log[#log + 1] = ('donner %s %s %s par %s'):format(args.cible, args.nombre, tostring(args.note), source)
+        end)
+        env.RegisterNetEvent('oxl:acheter', function(data) log[#log + 1] = 'achat ' .. data.item end)
+    end, function(env, _, player)
+        withLib(env, player.side, emu)
+        local lib = env.lib
+        lib.zones.sphere({ coords = env.vector3(0, 0, 30), radius = 5,
+            onEnter = function() log[#log + 1] = 'entre sphère' end, onExit = function() log[#log + 1] = 'sort sphère' end })
+        lib.zones.box({ coords = env.vector3(100, 0, 30), size = env.vector3(10, 2, 4), rotation = 90, nom = 'garage',
+            onEnter = function(self) log[#log + 1] = 'entre boîte ' .. self.nom end,
+            inside = function() insideCount = insideCount + 1 end })
+        lib.zones.poly({ points = { env.vec3(200, 0, 30), env.vec3(210, 0, 30), env.vec3(210, 10, 30), env.vec3(200, 10, 30) },
+            onEnter = function() log[#log + 1] = 'entre poly' end })
+        lib.points.new({ coords = env.vector3(300, 0, 30), distance = 3,
+            onEnter = function() log[#log + 1] = 'près du point' end, nearby = function() pointNearby = true end })
+        env.RegisterCommand('fouiller', function()
+            log[#log + 1] = 'fouille ' .. tostring(lib.progressBar({ duration = 2000, label = 'Fouille', canCancel = true }))
+        end)
+        env.RegisterCommand('menu', function()
+            lib.registerContext({ id = 'principal', title = 'Menu', options = {
+                { title = 'Info', description = 'sans action' },
+                { title = 'Sous-menu', menu = 'second' },
+                { title = 'Acheter', serverEvent = 'oxl:acheter', args = { item = 'eau' } },
+            } })
+            lib.registerContext({ id = 'second', title = 'Second', menu = 'principal', options = {
+                { title = 'Saluer', onSelect = function(a) log[#log + 1] = 'salut ' .. a.qui end, args = { qui = 'Bob' } },
+            } })
+            lib.showContext('principal')
+        end)
+        env.RegisterCommand('formulaire', function()
+            local r = lib.inputDialog('Facture', { { type = 'input', label = 'Motif', required = true },
+                                                   { type = 'number', label = 'Montant', min = 1, max = 500 } })
+            log[#log + 1] = 'formulaire ' .. (r and (r[1] .. '/' .. r[2]) or 'annulé')
+            log[#log + 1] = 'alerte ' .. tostring(lib.alertDialog({ header = 'Sûr ?', content = 'Confirmer', cancel = true }))
+        end)
+    end)
+    local p = emu:addPlayer({ pos = { x = 50.0, y = 0.0, z = 30.0 } })
+    emu:run(400)
+    p:setPosition(1.0, 0.0, 30.0)
+    emu:run(400)
+    p:setPosition(50.0, 0.0, 30.0)
+    emu:run(400)
+    T:check(hasText(log, 'entre sphère') and hasText(log, 'sort sphère'), 'zone sphère : onEnter puis onExit')
+    p:setPosition(104.0, 0.0, 30.0)
+    emu:run(400)
+    T:check(not hasText(log, 'entre boîte'), 'boîte 10 x 2 tournée de 90° : x + 4 est dehors')
+    p:setPosition(100.0, 4.0, 30.0)
+    emu:run(400)
+    T:check(hasText(log, 'entre boîte garage'), 'boîte tournée : y + 4 est dedans (champs perso dans self)')
+    T:check(insideCount >= 5, 'inside appelé à chaque image', insideCount)
+    p:setPosition(205.0, 5.0, 31.0)
+    emu:run(400)
+    T:check(hasText(log, 'entre poly'), 'zone polygone (épaisseur 4 par défaut)')
+    p:setPosition(301.0, 0.0, 30.0)
+    emu:run(400)
+    T:check(hasText(log, 'près du point') and pointNearby, 'point : onEnter et nearby')
+
+    T:same({ p:command('donner 1 5') }, { false, 'access_denied' }, 'addCommand restricted = group.admin : refusé sans le groupe')
+    emu:command(nil, 'add_principal player.1 group.admin')
+    p:command('donner me 5 pour le loyer')
+    emu:run(200)
+    T:check(hasText(log, 'donner 1 5 pour le loyer par 1'), 'paramètres typés : playerId « me », number, longString')
+    p:command('donner 9 5')
+    emu:run(200)
+    T:check(not hasText(log, 'donner 9') and hasText(emu.server.log, 'invalid playerId'),
+        'playerId inexistant : commande non exécutée, message dans la console')
+
+    p:command('fouiller')
+    emu:run(500)
+    T:eq(p:progress() and p:progress().label, 'Fouille', 'barre de progression en cours')
+    emu:run(2000)
+    T:check(hasText(log, 'fouille true'), 'barre terminée : true')
+    p:command('fouiller')
+    emu:run(500)
+    T:check(p:cancelProgress(), 'annulation par le joueur (canCancel)')
+    emu:run(100)
+    T:check(hasText(log, 'fouille false'), 'barre annulée : false')
+
+    p:command('menu')
+    emu:run(50)
+    T:eq(p:menu() and #p:menu().options, 3, 'menu contextuel ouvert, 3 options')
+    T:same({ p:selectMenu('Info') }, { false, 'no_action' }, 'option sans action : rien ne se passe')
+    T:check(p:selectMenu('Sous-menu') and p:menu().id == 'second', 'option menu : ouvre le sous-menu')
+    p:selectMenu(1)
+    emu:run(50)
+    T:check(hasText(log, 'salut Bob') and p:menu() == nil, 'onSelect(args) puis fermeture')
+    p:command('menu')
+    emu:run(50)
+    p:selectMenu('Acheter')
+    emu:run(200)
+    T:check(hasText(log, 'achat eau'), 'serverEvent avec args')
+
+    p:command('formulaire')
+    emu:run(50)
+    T:same({ p:answerInput({ 'Excès', 900 }) }, { false, 'hors limites : Montant' }, 'inputDialog : max contrôlé')
+    T:same({ p:answerInput({ Montant = 100 }) }, { false, 'champ requis : Motif' }, 'inputDialog : required contrôlé')
+    T:check(p:answerInput({ 'Excès', '120' }), 'inputDialog : réponse acceptée')
+    emu:run(50)
+    T:check(hasText(log, 'formulaire Excès/120'), 'valeurs reçues, nombre converti')
+    T:check(p:answerAlert('cancel'), 'alertDialog : annuler')
+    emu:run(50)
+    T:check(hasText(log, 'alerte cancel'), 'alertDialog renvoie « cancel »')
+
+    local q = emu:addPlayer({ pos = { x = 302.0, y = 0.0, z = 30.0 } })
+    emu:run(100)
+    local penv = emu:env(p, 'oxl')
+    T:eq(penv.lib.getClosestPlayer(penv.vector3(301, 0, 30), 5.0), q.id - 1, 'getClosestPlayer (client) : soi exclu')
+    local waited
+    penv.CreateThread(function()
+        local ok, err = pcall(penv.lib.waitFor, function() return nil end, 'jamais', 100)
+        waited = not ok and tostring(err):find('jamais', 1, true) ~= nil
+    end)
+    emu:run(300)
+    T:check(waited, 'lib.waitFor : erreur après le délai')
+    T:eq(#emu.errors, 0, 'aucune erreur', emu.errors[1])
+end
+
+-------------------------------------------------------------------------------
+T:section('Audit anti-triche (emu:fuzz)')
+-------------------------------------------------------------------------------
+do
+    local emu = Emu.new()
+    local db = require('mocks.oxmysql')(emu)
+    local esx = require('mocks.esx')(emu)
+    db:on('^INSERT INTO journal', { insertId = 1, affectedRows = 1 })
+    emu:defineResource('triche', { server = function(env)
+        local ESX = env.exports.es_extended:getSharedObject()
+        env.RegisterNetEvent('t:prime', function()
+            ESX.GetPlayerFromId(env.source).addAccountMoney('bank', 100)
+        end)
+        env.RegisterNetEvent('t:vendre', function(data)
+            -- prix venu du client : une faille
+            ESX.GetPlayerFromId(env.source).addAccountMoney('bank', data.prix * data.nombre)
+        end)
+        env.RegisterNetEvent('t:noter', function(texte)
+            env.exports.oxmysql:insert("INSERT INTO journal VALUES ('" .. tostring(texte) .. "')")
+        end)
+        env.RegisterNetEvent('t:sur', function(n)
+            if type(n) ~= 'number' or n ~= n or n < 0 then return env.DropPlayer(env.source, 'triche') end
+        end)
+    end })
+    emu:start('triche')
+    local a = emu:addPlayer({ name = 'Alice', esx = { accounts = { bank = 1000 } } })
+    local b = emu:addPlayer({ name = 'Bob', esx = { accounts = { bank = 1000 } } })
+    esx:waitLoaded(a)
+    esx:waitLoaded(b)
+    local client = emu:env(a, 'triche')
+    client.TriggerServerEvent('t:sur', 1)
+    client.TriggerServerEvent('t:vendre', { prix = 5, nombre = 2 })
+    client.TriggerServerEvent('t:noter', 'ok')
+    emu:run(500)
+    local r = emu:fuzz({ resources = { 'triche' } })
+    local function found(event, kind)
+        for _, f in ipairs(r.findings) do if f.event == event and f.kind:find(kind, 1, true) then return f end end
+    end
+    T:check(found('t:prime', 'anti-spam'), 'événement jamais observé : essayé quand même, rafale détectée', r:text())
+    T:check(found('t:vendre', 'gain (argument 1.prix)'), 'champ d\'une table modifié : gain sur data.prix', r:text())
+    T:check(found('t:noter', 'injection SQL'), 'injection SQL détectée dans la requête envoyée')
+    T:check(not found('t:sur', 'gain'), 't:sur (protégé) : aucun gain')
+    T:check(a.dropped, 'tricheur expulsé par la protection de t:sur')
+    T:eq(#r.events, 4, 'les 4 événements de la ressource sont audités')
+    T:eq(#emu.errors, 0, 'erreurs provoquées par l\'audit gardées hors de emu.errors', emu.errors[1])
+end
+
 local allOk = T:summary()
 os.exit(allOk and 0 or 1)

@@ -9,7 +9,7 @@
 -- apparaissent dans le rapport ; on les ajoute avec emu:native().
 local Emu = {}
 Emu.__index = Emu
-Emu.VERSION = '0.2.0'
+Emu.VERSION = '0.3.0'
 
 local unpack = table.unpack
 
@@ -443,15 +443,23 @@ end
 
 -- Liste les fichiers d'un dossier (chemins relatifs), sans dépendance externe
 local function listFiles(root)
-    local cmd = package.config:sub(1, 1) == '\\'
-        and ('dir /s /b /a-d "%s" 2>nul'):format(root:gsub('/', '\\'))
+    local windows = package.config:sub(1, 1) == '\\'
+    -- Windows : dir /s /b donne des chemins absolus ; « cd » affiche d'abord le chemin absolu de la racine
+    local cmd = windows
+        and ('cd /d "%s" 2>nul && cd && dir /s /b /a-d 2>nul'):format((root:gsub('/', '\\')))
         or ('find "%s" -type f 2>/dev/null'):format(root)
     local p = io.popen(cmd)
     local files = {}
     if p then
+        local prefix
+        if not windows then prefix = root end
         for line in p:lines() do
-            local rel = line:gsub('\\', '/'):sub(#root + 2)
-            files[#files + 1] = rel
+            line = line:gsub('\r$', '')
+            if not prefix then
+                prefix = line:gsub('[\\/]$', '')
+            else
+                files[#files + 1] = (line:sub(#prefix + 2):gsub('\\', '/'))
+            end
         end
         p:close()
     end
@@ -504,7 +512,8 @@ function Emu.new(opts)
         convars = opts.convars or {},
         aces = {}, principals = {},
         timeouts = {}, nextTimeout = 0,
-        mocks = {}, reporters = {},
+        mocks = {}, reporters = {}, probes = {},
+        nextBagCookie = 0,
         echo = opts.echo,
     }, Emu)
     self.server = self:_newSide('server', nil)
@@ -594,6 +603,7 @@ function Emu:_newSide(kind, player)
         name = kind == 'server' and 'serveur' or ('client ' .. player.id),
         handlers = {}, netEvents = {}, envs = {}, exports = {},
         threads = 0, commands = {}, log = {},
+        bags = {}, bagHandlers = {},
         frameMs = player and (1000 / (player.fps or 60)) or nil,
         dead = false,
     }
@@ -732,6 +742,93 @@ function Emu:_send(player, dir, name, args, onDeliver)
     end
     self:at(t, deliver)
     if p.chaos and self:rand() < (p.duplicate or 0) then self:at(t + 50 + 300 * self:rand(), deliver) end
+end
+
+-------------------------------------------------------------------------------
+-- State bags : GlobalState, Player(id).state, Entity(ent).state, LocalPlayer.state
+-------------------------------------------------------------------------------
+-- Comme FiveM : la valeur est copiée (msgpack) à l'écriture et à chaque lecture ; les gestionnaires
+-- AddStateBagChangeHandler sont appelés AVANT que la valeur change (state.x y donne encore l'ancienne valeur).
+-- Le serveur réplique vers tous les clients ; un client ne peut répliquer que son propre sac (player:<id>),
+-- et ce qu'il y écrit arrive au serveur puis aux autres joueurs.
+
+function Emu:_bag(side, name)
+    local b = side.bags[name]
+    if not b then b = { data = {}, replicated = {} } side.bags[name] = b end
+    return b
+end
+
+function Emu:_applyState(side, bagName, key, value, replicated)
+    if side.dead then return end
+    local list = side.bagHandlers
+    for _, h in ipairs(table.move(list, 1, #list, 1, {})) do
+        if not h.removed and (h.key == nil or h.key == '' or h.key == key)
+            and (h.bag == nil or h.bag == '' or h.bag == bagName) then
+            self:_spawn(side, h.resource, h.fn, true, bagName, key, netCopy(value), 0, replicated == true)
+        end
+    end
+    local b = self:_bag(side, bagName)
+    b.data[key] = value
+    b.replicated[key] = replicated and true or nil
+end
+
+function Emu:_replicateState(p, bagName, key, value)
+    self:_send(p, 'down', 'statebag:' .. bagName, table.pack(key, value), function(c)
+        self:_applyState(p.side, bagName, c[1], c[2], true)
+    end)
+end
+
+function Emu:_setState(side, bagName, key, value, replicated)
+    local ok, copy = pcall(netCopy, value)
+    if not ok then
+        self:_error(side, ('state bag %s, clé %s : %s'):format(bagName, tostring(key), copy))
+        return
+    end
+    if side.kind == 'server' then
+        self:_applyState(side, bagName, key, copy, replicated)
+        if replicated then
+            for _, p in ipairs(self.playerList) do self:_replicateState(p, bagName, key, copy) end
+        end
+        return
+    end
+    local p = side.player
+    if replicated and bagName ~= 'player:' .. p.id then
+        self:_warn(('%s : écriture refusée dans le state bag %s (clé %s) : un client ne réplique que son propre sac')
+            :format(side.name, bagName, tostring(key)))
+        return
+    end
+    self:_applyState(side, bagName, key, copy, replicated)
+    if not replicated then return end
+    self:_send(p, 'up', 'statebag:' .. bagName, table.pack(key, copy), function(c)
+        self:_applyState(self.server, bagName, c[1], c[2], true)
+        for _, other in ipairs(self.playerList) do
+            if other ~= p then self:_replicateState(other, bagName, c[1], c[2]) end
+        end
+    end)
+end
+
+-- Objet `state` : state.cle (copie), state.cle = v (répliqué côté serveur, local côté client, comme FiveM),
+-- state:set(cle, v, repliquer)
+function Emu:_stateProxy(side, bagName)
+    local emu = self
+    return setmetatable({ __data = bagName }, {
+        __index = function(_, k)
+            if k == 'set' then
+                return function(_, key, value, replicated) emu:_setState(side, bagName, key, value, replicated) end
+            end
+            local b = side.bags[bagName]
+            local v = b and b.data[k]
+            if type(v) == 'table' then return netCopy(v) end
+            return v
+        end,
+        __newindex = function(_, k, v) emu:_setState(side, bagName, k, v, side.kind == 'server') end,
+    })
+end
+
+-- Valeurs d'un state bag vues par le serveur (p = nil) ou par un joueur, pour les tests : emu:stateBag('global')
+function Emu:stateBag(bagName, p)
+    local b = (p and p.side or self.server).bags[bagName]
+    return b and netCopy(b.data) or {}
 end
 
 -------------------------------------------------------------------------------
@@ -900,6 +997,42 @@ function Emu:_nativesFor(side, resource, env)
         end,
     })
 
+    -- State bags. Entity(ent).state utilise directement le numéro d'entité (pas de netId sans OneSync émulé).
+    N.GlobalState = emu:_stateProxy(side, 'global')
+    N.Player = function(id)
+        local n = tonumber(id)
+        return { __data = n, state = emu:_stateProxy(side, 'player:' .. tostring(n)) }
+    end
+    N.Entity = function(ent) return { __data = ent, state = emu:_stateProxy(side, 'entity:' .. tostring(ent)) } end
+    N.AddStateBagChangeHandler = function(key, bag, fn)
+        emu.nextBagCookie = emu.nextBagCookie + 1
+        table.insert(side.bagHandlers, { key = key, bag = bag, fn = fn, resource = resource, cookie = emu.nextBagCookie })
+        return emu.nextBagCookie
+    end
+    N.RemoveStateBagChangeHandler = function(cookie)
+        for i = #side.bagHandlers, 1, -1 do
+            local h = side.bagHandlers[i]
+            if h.cookie == cookie then h.removed = true table.remove(side.bagHandlers, i) end
+        end
+    end
+    N.GetPlayerFromStateBagName = function(name)
+        local id = tonumber(tostring(name):match('^player:(%d+)$'))
+        if not id then return 0 end
+        return side.kind == 'server' and id or id - 1
+    end
+    N.GetEntityFromStateBagName = function(name) return tonumber(tostring(name):match('^entity:(%-?%d+)$')) or 0 end
+    N.GetStateBagValue = function(bag, key)
+        local b = side.bags[bag]
+        return b and netCopy(b.data[key])
+    end
+    N.GetStateBagKeys = function(bag)
+        local r = {}
+        for k in pairs(side.bags[bag] and side.bags[bag].data or {}) do r[#r + 1] = k end
+        table.sort(r, function(a, b) return tostring(a) < tostring(b) end)
+        return r
+    end
+    N.StateBagHasKey = function(bag, key) return side.bags[bag] ~= nil and side.bags[bag].data[key] ~= nil end
+
     if side.kind == 'server' then
         N.IsDuplicityVersion = function() return true end
         N.RegisterCommand = function(name, fn, restricted)
@@ -966,9 +1099,12 @@ function Emu:_nativesFor(side, resource, env)
     else
         local player = side.player
         N.IsDuplicityVersion = function() return false end
+        N.LocalPlayer = N.Player(player.id)
         N.TriggerServerEvent = function(name, ...)
             local args = table.pack(...)
-            player.sentToServer[#player.sentToServer + 1] = { t = emu.now, name = name }
+            -- copie des arguments : emu:fuzz rejoue ce trafic réel en le modifiant
+            local ok, copy = pcall(netCopy, args)
+            player.sentToServer[#player.sentToServer + 1] = { t = emu.now, name = name, args = ok and copy or nil }
             emu:_send(player, 'up', name, args, function(copy)
                 emu:_dispatch(emu.server, name, copy, player.id, true)
             end)
@@ -1279,6 +1415,9 @@ function Emu:stop(name)
             for i = #list, 1, -1 do if list[i].resource == name then list[i].removed = true table.remove(list, i) end end
         end
         for _, set in pairs(side.netEvents) do set[name] = nil end
+        for i = #side.bagHandlers, 1, -1 do
+            if side.bagHandlers[i].resource == name then side.bagHandlers[i].removed = true table.remove(side.bagHandlers, i) end
+        end
         side.envs[name] = nil
         side.exports[name] = nil
         if side.player then
@@ -1315,6 +1454,8 @@ function Emu:addPlayer(opts)
         net = { down = { bytes = 0, packets = 0 }, up = { bytes = 0, packets = 0 }, downLast = 0, upLast = 0 },
         draws = {}, texts = {}, nui = {}, nuiCallbacks = {}, clientCommands = {}, entities = {}, controls = {},
         notifications = {},
+        -- interface ox_lib : menu contextuel, dialogues, barre de progression, TextUI (voir les aides plus bas)
+        ui = { contexts = {}, progressLog = {}, contextLog = {} },
         received = {}, sentToClient = {}, sentToServer = {}, dropped = false, joinedAt = self.now,
     }
     p.side = self:_newSide('client', p)
@@ -1334,8 +1475,21 @@ function Emu:addPlayer(opts)
             if not text or json.encode(n.data):find(text, 1, true) then return n end
         end
     end
+    -- ox_lib : ce que le joueur ferait dans l'interface
+    function p:menu() return emu:_openMenu(self) end
+    function p:selectMenu(which) return emu:_selectMenu(self, which) end
+    function p:closeMenu() return emu:_closeMenu(self) end
+    function p:answerInput(values) return emu:_answerInput(self, values) end
+    function p:answerAlert(answer) return emu:_answerAlert(self, answer) end
+    function p:cancelProgress() return emu:_cancelProgress(self, true) end
+    function p:progress() return self.ui.progress end
+    function p:textUI() return self.ui.textUI end
     self.players[id] = p
     self.playerList[#self.playerList + 1] = p
+    -- State bags : le nouveau client reçoit l'état répliqué déjà présent (sans appeler les gestionnaires)
+    for bagName, b in pairs(self.server.bags) do
+        for k in pairs(b.replicated) do self:_bag(p.side, bagName).data[k] = netCopy(b.data[k]) end
+    end
     -- Côté serveur : arrivée du joueur ; côté client : ressources déjà démarrées
     self:_dispatch(self.server, 'playerJoining', table.pack(tostring(id)), id, false)
     for _, name in ipairs(self.startOrder) do
@@ -1354,6 +1508,9 @@ function Emu:dropPlayer(p, reason)
     p.dropping = nil
     p.dropped = true
     p.droppedAt = self.now
+    -- le sac du joueur disparaît avec lui
+    self.server.bags['player:' .. p.id] = nil
+    for _, other in ipairs(self.playerList) do other.side.bags['player:' .. p.id] = nil end
 end
 
 -- ACL minimale, comme add_ace / add_principal : le joueur est « player.<id> », hérite de « identifier.<id> »
@@ -1522,6 +1679,369 @@ function Emu:report()
 end
 
 -------------------------------------------------------------------------------
+-- Audit anti-triche : emu:fuzz
+-------------------------------------------------------------------------------
+-- Rejoue les événements réseau serveur comme le ferait un tricheur (exécuteur Lua) : le vrai trafic observé
+-- pendant le test, modifié argument par argument avec des valeurs piégées, envoyé en rafale, depuis trop loin.
+-- Des sondes mesurent l'argent et les objets de chaque joueur avant et après chaque tentative ; tout ce qui
+-- rapporte plus que l'appel normal, ou fait perdre quelque chose à un autre joueur, est signalé.
+
+-- Sonde : fn(joueur) → { clé = nombre }. Les mocks ESX et ox_inventory ajoutent les leurs.
+function Emu:addProbe(name, fn)
+    self.probes[name] = fn
+end
+
+local INJECTION = "emu' OR '1'='1"
+local HOSTILE = {
+    { label = 'nil' }, { label = '-1', value = -1 }, { label = '0', value = 0 }, { label = '-100000', value = -100000 },
+    { label = '1e9', value = 1000000000 }, { label = '2^31', value = 2147483648 }, { label = '0.5', value = 0.5 },
+    { label = 'NaN', value = 0 / 0 }, { label = 'inf', value = math.huge }, { label = "''", value = '' },
+    { label = 'chaîne de 10 Ko', value = string.rep('A', 10000) }, { label = 'injection SQL', value = INJECTION },
+    { label = '{}', value = {} }, { label = 'true', value = true },
+}
+local SEVERITY = { critique = 1, attention = 2, info = 3 }
+
+function Emu:_probeAll()
+    local snap = {}
+    for _, p in ipairs(self.playerList) do
+        if not p.dropped then
+            local s = {}
+            for name, fn in pairs(self.probes) do
+                local ok, r = pcall(fn, p)
+                if ok and type(r) == 'table' then
+                    for k, v in pairs(r) do if type(v) == 'number' then s[name .. ':' .. k] = v end end
+                end
+            end
+            snap[p.id] = s
+        end
+    end
+    return snap
+end
+
+local function probeDelta(a, b)
+    local d = {}
+    for id, after in pairs(b) do
+        local before = a[id] or {}
+        local keys = {}
+        for k in pairs(after) do keys[k] = true end
+        for k in pairs(before) do keys[k] = true end
+        for k in pairs(keys) do
+            local x1, x0 = after[k] or 0, before[k] or 0
+            local x = x1 - x0
+            -- déjà corrompue avant la tentative : ce n'est pas cette tentative qui l'a cassée
+            if x ~= 0 and x0 == x0 and math.abs(x0) ~= math.huge then d[id] = d[id] or {} d[id][k] = x end
+        end
+    end
+    return d
+end
+
+local function fmtNum(x) return math.type(x) == 'integer' and ('%+d'):format(x) or ('%+.2f'):format(x) end
+
+-- opts : resources = { noms } (par défaut : ressources lues sur disque), events = { noms } (filtre), skip = { noms },
+-- player = joueur tricheur (par défaut : celui qui a envoyé le trafic observé, sinon le premier),
+-- settle (ms d'attente après chaque envoi), spam (10 envois en rafale), maxCalls (2 appels observés par événement).
+-- Renvoie { findings = { { severity, event, kind, detail, args } }, attempts, events } et r:text().
+-- À lancer en fin de test : les tentatives modifient l'état (argent, objets…). Les erreurs Lua provoquées
+-- sont rangées dans le résultat, pas dans emu.errors.
+function Emu:fuzz(opts)
+    opts = opts or {}
+    local emu = self
+    local result = { findings = {}, attempts = 0, events = {} }
+    local seen = {}
+
+    local targets = {}
+    if opts.resources then
+        for _, r in ipairs(opts.resources) do targets[r] = true end
+    else
+        for name in pairs(self.started) do
+            local r = self.resources[name]
+            if r and not r.virtual then targets[name] = true end
+        end
+    end
+    local only, skip = nil, {}
+    if opts.events then only = {} for _, e in ipairs(opts.events) do only[e] = true end end
+    for _, e in ipairs(opts.skip or {}) do skip[e] = true end
+
+    local function display(name)
+        local cb = name:match('^__emu_ox_cb:(.+)$')
+        return cb and ('lib.callback « %s »'):format(cb) or name
+    end
+
+    -- Événements visés et leur nombre de paramètres (debug.getinfo), triés pour un résultat reproductible
+    local events = {}
+    for name, set in pairs(self.server.netEvents) do
+        local wanted = false
+        for r in pairs(set) do if targets[r] then wanted = true end end
+        if wanted and not skip[name] and (not only or only[name]) and name ~= '__emu_ox_cb:reply' then
+            local arity, vararg = 0, false
+            for _, h in ipairs(self.server.handlers[name] or {}) do
+                if targets[h.resource] then
+                    local info = debug.getinfo(h.fn, 'u')
+                    arity = math.max(arity, info.nparams)
+                    vararg = vararg or info.isvararg
+                end
+            end
+            if vararg then arity = math.max(arity, 3) end
+            events[#events + 1] = { name = name, arity = arity }
+        end
+    end
+    table.sort(events, function(a, b) return a.name < b.name end)
+
+    local function anyPlayer()
+        for _, p in ipairs(self.playerList) do if not p.dropped then return p end end
+    end
+
+    -- Trafic réel observé : par événement, les premiers appels distincts et leur expéditeur
+    local observed = {}
+    for _, p in ipairs(self.playerList) do
+        for _, m in ipairs(p.sentToServer) do
+            if m.args then
+                local list = observed[m.name] or {}
+                observed[m.name] = list
+                local key = json.encode(m.args)
+                if #list < (opts.maxCalls or 2) and not list[key] then
+                    list[key] = true
+                    list[#list + 1] = { sender = p, args = m.args }
+                end
+            end
+        end
+    end
+
+    local function sqlLogSize() return self.mocks.oxmysql and #self.mocks.oxmysql.log or 0 end
+
+    local function attempt(sender, name, args, copies)
+        local before = self:_probeAll()
+        local nErr, nWarn, nSql = #self.errors, #self.warnings, sqlLogSize()
+        for _ = 1, copies or 1 do
+            self:_send(sender, 'up', name, args, function(copy) self:_dispatch(self.server, name, copy, sender.id, true) end)
+        end
+        local settle = opts.settle or ((sender.profile.rtt + (sender.profile.jitter or 0)) * 2 + 500)
+        self:run(settle)
+        result.attempts = result.attempts + 1
+        local r = { delta = probeDelta(before, self:_probeAll()), errors = {}, dropped = sender.dropped }
+        for i = nErr + 1, #self.errors do r.errors[#r.errors + 1] = self.errors[i] end
+        for i = #self.errors, nErr + 1, -1 do self.errors[i] = nil end
+        for i = #self.warnings, nWarn + 1, -1 do self.warnings[i] = nil end
+        if self.mocks.oxmysql then
+            for i = nSql + 1, #self.mocks.oxmysql.log do
+                local q = self.mocks.oxmysql.log[i].query
+                if type(q) == 'string' and q:find(INJECTION, 1, true) then r.sql = q end
+            end
+        end
+        return r
+    end
+
+    local function add(severity, event, kind, detail, args)
+        local key = event .. '|' .. kind
+        if seen[key] then return end
+        seen[key] = true
+        result.findings[#result.findings + 1] = { severity = severity, event = display(event), kind = kind,
+                                                  detail = detail, args = args }
+    end
+
+    local function hasPositive(delta, id)
+        for _, x in pairs(delta[id] or {}) do if x > 0 then return true end end
+        return false
+    end
+    local function bad(x) return x ~= x or x == math.huge or x == -math.huge end
+
+    -- Ce qui change par rapport à l'appel normal :
+    --  gain = le tricheur finit avec plus qu'avant et plus qu'avec l'appel normal (payer moins n'est pas un gain) ;
+    --  moins cher = au moins tout ce que donne l'appel normal, en payant moins ;
+    --  perte = un autre joueur finit avec moins qu'avant et moins qu'avec l'appel normal ;
+    --  une valeur qui devient NaN ou infinie compte toujours.
+    local function compare(sender, r, control)
+        local gains, losses = {}, {}
+        local mine, ref = r.delta[sender.id] or {}, control.delta[sender.id] or {}
+        for k, x in pairs(mine) do
+            local base = ref[k] or 0
+            if bad(x) then
+                gains[#gains + 1] = ('%s devient %s (valeur corrompue)'):format(k, tostring(x))
+            elseif x > 0 and x > base then
+                gains[#gains + 1] = ('%s %s (appel normal : %s)'):format(k, fmtNum(x), fmtNum(base))
+            end
+        end
+        if #gains == 0 and hasPositive(control.delta, sender.id) then
+            local keys, better, worse = {}, {}, false
+            for k in pairs(mine) do keys[k] = true end
+            for k in pairs(ref) do keys[k] = true end
+            for k in pairs(keys) do
+                local x, base = mine[k] or 0, ref[k] or 0
+                if x < base then worse = true end
+                if x > base then better[#better + 1] = ('%s %s (appel normal : %s)'):format(k, fmtNum(x), fmtNum(base)) end
+            end
+            if not worse and #better > 0 then
+                table.sort(better)
+                gains[1] = 'même résultat pour moins cher : ' .. table.concat(better, ', ')
+            end
+        end
+        for id, d in pairs(r.delta) do
+            if id ~= sender.id then
+                local cref = control.delta[id] or {}
+                for k, x in pairs(d) do
+                    local base = cref[k] or 0
+                    if bad(x) or (x < 0 and x < base) then
+                        losses[#losses + 1] = ('joueur %d : %s %s (appel normal : %s)'):format(id, k, fmtNum(x), fmtNum(base))
+                    end
+                end
+            end
+        end
+        table.sort(gains)
+        table.sort(losses)
+        return gains, losses
+    end
+
+    -- Effet « qui rapporte » : le joueur reçoit quelque chose, ou un autre joueur perd quelque chose
+    local function rewarding(delta, id)
+        if hasPositive(delta, id) then return true end
+        for other, d in pairs(delta) do
+            if other ~= id then for _, x in pairs(d) do if x < 0 then return true end end end
+        end
+        return false
+    end
+
+    local function victimOf(sender)
+        for _, p in ipairs(self.playerList) do if p ~= sender and not p.dropped then return p end end
+    end
+
+    -- Remplace par un nouveau joueur identique un tricheur expulsé (DropPlayer = protection qui marche) ou dont
+    -- une valeur est devenue NaN / infinie (les mesures suivantes n'auraient plus de sens)
+    local function ensureAlive(sender)
+        if not sender.dropped then
+            for _, v in pairs(self:_probeAll()[sender.id] or {}) do
+                if v ~= v or v == math.huge or v == -math.huge then
+                    self:dropPlayer(sender, 'audit : valeurs corrompues')
+                    break
+                end
+            end
+        end
+        if not sender.dropped then return sender end
+        local clone = self:addPlayer(sender.opts)
+        self:run(opts.joinMs or 3000)
+        return clone
+    end
+
+    for _, ev in ipairs(events) do
+        local name = ev.name
+        result.events[#result.events + 1] = display(name)
+        local calls = observed[name]
+        local isCallback = name:find('^__emu_ox_cb:') ~= nil
+        if not calls then
+            local sender = opts.player or anyPlayer()
+            if not sender then break end
+            local args = { n = ev.arity }
+            if isCallback then args[1], args.n = 'fuzz', math.max(args.n, 2) end
+            calls = { { sender = sender, args = args, synthetic = true } }
+        end
+        for _, call in ipairs(calls) do
+            local sender = ensureAlive(opts.player or call.sender)
+            local base = call.args
+            local control = attempt(sender, name, base)
+            if control.dropped then
+                add('info', name, 'expulsion', 'l\'appel normal expulse déjà le joueur (DropPlayer)', base)
+                sender = ensureAlive(sender)
+            end
+
+            -- Variantes : chaque argument (et chaque champ d'un argument table) remplacé par une valeur piégée
+            local variants = {}
+            local first = isCallback and 2 or 1
+            local victim = victimOf(sender)
+            for i = first, math.max(base.n or #base, ev.arity) do
+                local values = table.move(HOSTILE, 1, #HOSTILE, 1, {})
+                if victim then values[#values + 1] = { label = ('id d\'un autre joueur (%d)'):format(victim.id), value = victim.id } end
+                for _, h in ipairs(values) do
+                    local a = netCopy(base)
+                    a.n = math.max(a.n or #a, i)
+                    a[i] = netCopy(h.value)
+                    variants[#variants + 1] = { args = a, pos = ('argument %d'):format(i - first + 1), label = h.label }
+                end
+                if type(base[i]) == 'table' and getmetatable(base[i]) ~= VEC then
+                    local fields = {}
+                    for k in pairs(base[i]) do fields[#fields + 1] = k end
+                    table.sort(fields, function(x, y) return tostring(x) < tostring(y) end)
+                    for f = 1, math.min(#fields, 8) do
+                        for _, h in ipairs(values) do
+                            local a = netCopy(base)
+                            a[i][fields[f]] = netCopy(h.value)
+                            variants[#variants + 1] = { args = a, label = h.label,
+                                pos = ('argument %d.%s'):format(i - first + 1, tostring(fields[f])) }
+                        end
+                    end
+                end
+            end
+
+            for _, v in ipairs(variants) do
+                local r = attempt(sender, name, v.args)
+                local gains, losses = compare(sender, r, control)
+                local with = ('valeur %s'):format(v.label)
+                if #gains > 0 then
+                    add('critique', name, ('gain (%s)'):format(v.pos), ('%s → %s'):format(with, table.concat(gains, ', ')), v.args)
+                end
+                if #losses > 0 then
+                    add('critique', name, ('perte pour un autre joueur (%s)'):format(v.pos),
+                        ('%s → %s'):format(with, table.concat(losses, ', ')), v.args)
+                end
+                if r.sql then add('critique', name, ('injection SQL (%s)'):format(v.pos), 'requête envoyée : ' .. r.sql, v.args) end
+                if #r.errors > 0 and #control.errors == 0 then
+                    add('info', name, ('erreur Lua (%s)'):format(v.pos),
+                        ('%s → %s'):format(with, (r.errors[1]:gsub('\n.*', ''))), v.args)
+                end
+                sender = ensureAlive(sender)
+            end
+
+            -- Rafale : un gain répété à chaque envoi = pas d'anti-spam (cooldown, verrou, état « déjà fait »)
+            if hasPositive(control.delta, sender.id) then
+                local n = opts.spam or 10
+                local r = attempt(sender, name, base, n)
+                local gains = {}
+                for k, x in pairs(r.delta[sender.id] or {}) do
+                    local one = (control.delta[sender.id] or {})[k] or 0
+                    if one > 0 and x >= 2 * one then gains[#gains + 1] = ('%s %s (1 envoi : %s)'):format(k, fmtNum(x), fmtNum(one)) end
+                end
+                table.sort(gains)
+                if #gains > 0 then
+                    add('attention', name, 'pas d\'anti-spam', ('%d envois en rafale : %s'):format(n, table.concat(gains, ', ')), base)
+                end
+                sender = ensureAlive(sender)
+            end
+
+            -- Distance : le même gain depuis 10 km = la position n'est pas vérifiée côté serveur
+            if rewarding(control.delta, sender.id) then
+                local pos = sender.pos
+                sender.pos = { x = pos.x + 10000.0, y = pos.y + 10000.0, z = pos.z }
+                local r = attempt(sender, name, base)
+                sender.pos = pos
+                if Emu.deepEqual(r.delta, control.delta) then
+                    add('attention', name, 'aucun contrôle de distance', 'même effet à 10 km de la position du test', base)
+                end
+                sender = ensureAlive(sender)
+            end
+        end
+    end
+
+    table.sort(result.findings, function(a, b)
+        if SEVERITY[a.severity] ~= SEVERITY[b.severity] then return SEVERITY[a.severity] < SEVERITY[b.severity] end
+        if a.event ~= b.event then return a.event < b.event end
+        return a.kind < b.kind
+    end)
+
+    function result:count(severity)
+        local n = 0
+        for _, f in ipairs(self.findings) do if not severity or f.severity == severity then n = n + 1 end end
+        return n
+    end
+    function result:text()
+        local lines = { ('Audit anti-triche : %d événement(s), %d tentative(s), %d critique(s), %d attention, %d info')
+            :format(#self.events, self.attempts, self:count('critique'), self:count('attention'), self:count('info')) }
+        for _, f in ipairs(self.findings) do
+            lines[#lines + 1] = ('  %-9s %s — %s : %s'):format(f.severity:upper(), f.event, f.kind, f.detail)
+        end
+        return table.concat(lines, '\n')
+    end
+    return result
+end
+
+-------------------------------------------------------------------------------
 -- Vérifications pour les scripts de test
 -------------------------------------------------------------------------------
 
@@ -1643,7 +2163,504 @@ function Emu:_installDefaultProviders()
         env.locale = function(key, ...) return key end
         env.cache = { resource = resource, game = 'fivem', playerId = side.player and side.player.id - 1,
                       serverId = side.player and side.player.id, ped = side.player and side.player.ped }
+        emu:_oxlibExtras(lib, env, side, resource)
     end)
+end
+
+-------------------------------------------------------------------------------
+-- ox_lib : modules au-delà des rappels (zones, points, commandes, interface, outils)
+-------------------------------------------------------------------------------
+
+local function xyz(c)
+    if c == nil then return 0.0, 0.0, 0.0 end
+    return c.x or c[1] or 0.0, c.y or c[2] or 0.0, c.z or c[3] or 0.0
+end
+
+local function distance3(c, x, y, z)
+    local cx, cy, cz = xyz(c)
+    return math.sqrt((x - cx) ^ 2 + (y - cy) ^ 2 + (z - cz) ^ 2)
+end
+
+-- Zones ox_lib : sphere (rayon, 2 par défaut), box (taille, rotation en degrés autour de z), poly (points, épaisseur 4)
+local function zoneContains(zone, px, py, pz)
+    if zone.__kind == 'sphere' then
+        return distance3(zone.coords, px, py, pz) < zone.radius
+    elseif zone.__kind == 'box' then
+        local x, y, z = xyz(zone.coords)
+        local sx, sy, sz = xyz(zone.size)
+        local r = -math.rad(zone.rotation or 0)
+        local dx, dy = px - x, py - y
+        local lx, ly = dx * math.cos(r) - dy * math.sin(r), dx * math.sin(r) + dy * math.cos(r)
+        return math.abs(lx) <= sx / 2 and math.abs(ly) <= sy / 2 and math.abs(pz - z) <= sz / 2
+    end
+    -- polygone : test de parité en x/y, hauteur = z moyen des points ± épaisseur / 2
+    local pts, inside, sumZ = zone.points, false, 0
+    local j = #pts
+    for i = 1, #pts do
+        local xi, yi, zi = xyz(pts[i])
+        local xj, yj = xyz(pts[j])
+        sumZ = sumZ + zi
+        if (yi > py) ~= (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi) + xi then inside = not inside end
+        j = i
+    end
+    return inside and math.abs(pz - sumZ / #pts) <= zone.thickness / 2
+end
+
+local function tableMatches(a, b)
+    if type(a) ~= type(b) then return false end
+    if type(a) ~= 'table' then return a == b end
+    for k, v in pairs(a) do if not tableMatches(v, b[k]) then return false end end
+    for k in pairs(b) do if a[k] == nil then return false end end
+    return true
+end
+
+local function deepclone(t)
+    if type(t) ~= 'table' then return t end
+    local r = {}
+    for k, v in pairs(t) do r[k] = deepclone(v) end
+    return setmetatable(r, getmetatable(t))
+end
+
+function Emu:_oxlibExtras(lib, env, side, resource)
+    local emu = self
+
+    -- Attend que cb() renvoie autre chose que nil (1 s par défaut, false = sans limite), comme lib.waitFor
+    function lib.waitFor(cb, errMessage, timeout)
+        local value = cb()
+        if value ~= nil then return value end
+        if timeout == nil or (timeout and type(timeout) ~= 'number') then timeout = 1000 end
+        local start = emu.now
+        while value == nil do
+            env.Wait(0)
+            local elapsed = emu.now - start
+            if timeout and elapsed > timeout then
+                error(('%s (waited %.1fms)'):format(errMessage or 'failed to resolve callback', elapsed), 2)
+            end
+            value = cb()
+        end
+        return value
+    end
+
+    lib.table = {
+        -- valeur, ou table de valeurs qui doivent toutes être présentes
+        contains = function(tbl, value)
+            if type(value) ~= 'table' then
+                for _, v in pairs(tbl) do if v == value then return true end end
+                return false
+            end
+            for _, needed in pairs(value) do
+                local found = false
+                for _, v in pairs(tbl) do if v == needed then found = true break end end
+                if not found then return false end
+            end
+            return true
+        end,
+        matches = tableMatches,
+        deepclone = deepclone,
+        merge = function(t1, t2, addDuplicateNumbers)
+            if addDuplicateNumbers == nil then addDuplicateNumbers = true end
+            for k, v in pairs(t2) do
+                local v1 = t1[k]
+                if type(v1) == 'table' and type(v) == 'table' then lib.table.merge(v1, v, addDuplicateNumbers)
+                elseif addDuplicateNumbers and type(v1) == 'number' and type(v) == 'number' then t1[k] = v1 + v
+                else t1[k] = v end
+            end
+            return t1
+        end,
+    }
+
+    -- Joueurs proches : { id, ped, coords } ; id = id serveur côté serveur, index de joueur côté client
+    local function nearbyPlayers(coords, maxDistance, skipId)
+        local r = {}
+        local x, y, z = xyz(coords)
+        for _, o in ipairs(emu.playerList) do
+            if not o.dropped and o.id ~= skipId then
+                local d = distance3(o.pos, x, y, z)
+                if d <= (maxDistance or 2.0) then
+                    r[#r + 1] = { id = side.kind == 'server' and o.id or o.id - 1, ped = o.ped,
+                                  coords = vec3(o.pos.x, o.pos.y, o.pos.z), distance = d }
+                end
+            end
+        end
+        return r
+    end
+    local function closest(list)
+        local best
+        for _, o in ipairs(list) do if not best or o.distance < best.distance then best = o end end
+        if best then return best.id, best.ped, best.coords end
+    end
+
+    if side.kind == 'server' then
+        function lib.getNearbyPlayers(coords, maxDistance, ignorePlayerId)
+            local r = nearbyPlayers(coords, maxDistance, ignorePlayerId)
+            for _, o in ipairs(r) do o.distance = nil end
+            return r
+        end
+        function lib.getClosestPlayer(coords, maxDistance, ignorePlayerId)
+            return closest(nearbyPlayers(coords, maxDistance, ignorePlayerId))
+        end
+        function lib.addAce(principal, ace, allow) emu:addAce(principal, ace, allow) end
+        function lib.removeAce(principal, ace) emu:removeAce(principal, ace) end
+        function lib.addPrincipal(child, parent) emu:addPrincipal(child, parent) end
+        function lib.removePrincipal(child, parent) emu:removePrincipal(child, parent) end
+
+        -- Arguments typés comme ox_lib : number, string (pas un nombre), playerId ('me' = soi), longString (le reste).
+        -- Un argument invalide ou manquant (non optionnel) : message dans la console et la commande ne s'exécute pas.
+        local function parseArguments(source, args, raw, params)
+            for i = 1, #params do
+                local arg, param = args[i], params[i]
+                local value
+                if param.type == 'number' then value = tonumber(arg)
+                elseif param.type == 'string' then value = not tonumber(arg) and arg
+                elseif param.type == 'playerId' then
+                    value = arg == 'me' and source or tonumber(arg)
+                    local o = value and emu.players[value]
+                    if not o or o.dropped then value = false end
+                elseif param.type == 'longString' and i == #params then
+                    if arg then
+                        local start = raw:find(arg, 1, true)
+                        value = start and raw:sub(start)
+                    end
+                else value = arg end
+                if not value and (not param.optional or arg) then
+                    env.Citizen.Trace(("command '%s' received an invalid %s for argument %s (%s), received '%s'")
+                        :format(raw:match('^(%S+)') or raw, tostring(param.type), i, tostring(param.name), tostring(arg)))
+                    return nil
+                end
+                args[param.name] = value or nil
+                args[i] = nil
+            end
+            return args
+        end
+
+        -- lib.addCommand('nom' ou { 'a', 'b' }, { help, params, restricted = 'group.admin' | true }, fn(source, args, raw))
+        function lib.addCommand(commandName, properties, cb)
+            local names = type(commandName) == 'table' and commandName or { commandName }
+            local params = properties and properties.params
+            local restricted = properties and properties.restricted
+            for _, name in ipairs(names) do
+                env.RegisterCommand(name, function(source, args, raw)
+                    if params then
+                        args = parseArguments(source, args, raw, params)
+                        if not args then return end
+                    end
+                    cb(source, args, raw)
+                end, restricted and true or false)
+                if type(restricted) == 'string' then emu:addAce(restricted, 'command.' .. name, true)
+                elseif type(restricted) == 'table' then
+                    for _, principal in ipairs(restricted) do emu:addAce(principal, 'command.' .. name, true) end
+                end
+            end
+        end
+        return
+    end
+
+    local player = side.player
+    local ui = player.ui
+
+    function lib.getNearbyPlayers(coords, maxDistance, includePlayer)
+        local r = nearbyPlayers(coords, maxDistance, not includePlayer and player.id or nil)
+        for _, o in ipairs(r) do o.distance = nil end
+        return r
+    end
+    function lib.getClosestPlayer(coords, maxDistance, includePlayer)
+        return closest(nearbyPlayers(coords, maxDistance, not includePlayer and player.id or nil))
+    end
+
+    -- Chargement d'assets : tout est déjà « chargé » ; requestModel renvoie le hash
+    function lib.requestModel(model) return type(model) == 'string' and joaat(model) or model end
+    for _, n in ipairs({ 'requestAnimDict', 'requestAnimSet', 'requestNamedPtfxAsset', 'requestStreamedTextureDict',
+                         'requestWeaponAsset', 'requestScaleformMovie', 'requestAudioBank' }) do
+        lib[n] = function(asset) return asset end
+    end
+    function lib.onCache() end
+
+    -- Zones et points : entrées / sorties évaluées toutes les 300 ms, inside et nearby à chaque image (comme ox_lib)
+    local zones, points, looping, nextZone = {}, {}, false, 0
+    local function call(obj, fname)
+        local ok, err = pcall(obj[fname], obj)
+        if not ok then emu:_error(side, ('ox_lib %s (%s) : %s'):format(fname, resource, tostring(err))) end
+    end
+    local function startLoop()
+        if looping then return end
+        looping = true
+        env.CreateThread(function()
+            while true do
+                local px, py, pz = player.pos.x, player.pos.y, player.pos.z
+                for _, zone in ipairs(table.move(zones, 1, #zones, 1, {})) do
+                    zone.distance = distance3(zone.coords, px, py, pz)
+                    local inside = zoneContains(zone, px, py, pz)
+                    if inside and not zone.insideZone then
+                        zone.insideZone = true
+                        if zone.onEnter then call(zone, 'onEnter') end
+                    elseif not inside and zone.insideZone then
+                        zone.insideZone = false
+                        if zone.onExit then call(zone, 'onExit') end
+                    end
+                end
+                local best
+                for _, point in ipairs(table.move(points, 1, #points, 1, {})) do
+                    local d = distance3(point.coords, px, py, pz)
+                    if d <= point.distance then
+                        point.currentDistance = d
+                        if not best or d < best.currentDistance then best = point end
+                        if not point.__near then
+                            point.__near = true
+                            if point.onEnter then call(point, 'onEnter') end
+                        end
+                    elseif point.__near then
+                        point.__near, point.currentDistance = false, nil
+                        if point.onExit then call(point, 'onExit') end
+                    end
+                end
+                for _, point in ipairs(points) do point.isClosest = point == best end
+                env.Wait(300)
+            end
+        end)
+        env.CreateThread(function()
+            while true do
+                for _, zone in ipairs(table.move(zones, 1, #zones, 1, {})) do
+                    if zone.insideZone and zone.inside then call(zone, 'inside') end
+                end
+                for _, point in ipairs(table.move(points, 1, #points, 1, {})) do
+                    if point.__near and point.nearby then call(point, 'nearby') end
+                end
+                env.Wait(0)
+            end
+        end)
+    end
+    local function removeFrom(list, obj)
+        for i = #list, 1, -1 do if list[i] == obj then table.remove(list, i) end end
+    end
+
+    local function newZone(kind, data)
+        data.__kind = kind
+        if kind == 'sphere' then
+            data.radius = data.radius or 2.0
+        elseif kind == 'box' then
+            data.size = data.size or vec3(2.0, 2.0, 2.0)
+            data.rotation = data.rotation or 0
+        else
+            data.thickness = data.thickness or 4
+            local sx, sy, sz = 0, 0, 0
+            for _, pt in ipairs(data.points) do local x, y, z = xyz(pt) sx, sy, sz = sx + x, sy + y, sz + z end
+            local n = #data.points
+            data.coords = data.coords or vec3(sx / n, sy / n, sz / n)
+        end
+        nextZone = nextZone + 1
+        data.id = nextZone
+        function data.remove(self) removeFrom(zones, self) end
+        function data.contains(self, coords) return zoneContains(self, xyz(coords)) end
+        zones[#zones + 1] = data
+        startLoop()
+        return data
+    end
+    lib.zones = {
+        sphere = function(data) return newZone('sphere', data) end,
+        box = function(data) return newZone('box', data) end,
+        poly = function(data) return newZone('poly', data) end,
+        getAllZones = function() return zones end,
+        getCurrentZones = function()
+            local r = {}
+            for _, zone in ipairs(zones) do if zone.insideZone then r[#r + 1] = zone end end
+            return r
+        end,
+    }
+
+    -- lib.points.new({ coords, distance, onEnter, onExit, nearby, … }) ou new(coords, distance, data)
+    lib.points = {
+        new = function(a, b, c)
+            local data = a
+            if getmetatable(a) == VEC or a.coords == nil then data = c or {} data.coords, data.distance = a, b end
+            data.distance = data.distance or 1.0
+            function data.remove(self) removeFrom(points, self) end
+            points[#points + 1] = data
+            startLoop()
+            return data
+        end,
+        getAllPoints = function() return points end,
+        getNearbyPoints = function()
+            local r = {}
+            for _, point in ipairs(points) do if point.__near then r[#r + 1] = point end end
+            return r
+        end,
+        getClosestPoint = function() for _, point in ipairs(points) do if point.isClosest then return point end end end,
+    }
+
+    -- Barre de progression : bloque le fil jusqu'à la fin (true) ou l'annulation (false) ;
+    -- annulée par p:cancelProgress() (si canCancel), lib.cancelProgress(), ou la mort sans useWhileDead
+    local function progress(kind, data)
+        if ui.progress then return false end
+        local entry = { kind = kind, label = data.label, duration = data.duration or 0, canCancel = data.canCancel == true,
+                        data = data, t = emu.now, resource = resource }
+        ui.progress = entry
+        ui.progressLog[#ui.progressLog + 1] = entry
+        local endAt = emu.now + entry.duration
+        while not entry.cancelled do
+            if not data.useWhileDead and player.health <= 0 then entry.cancelled = 'mort' break end
+            if emu.now >= endAt - 1e-9 then break end
+            env.Wait(0)
+        end
+        ui.progress = nil
+        entry.finished, entry.endedAt = not entry.cancelled, emu.now
+        return entry.finished
+    end
+    function lib.progressBar(data) return progress('bar', data) end
+    function lib.progressCircle(data) return progress('circle', data) end
+    function lib.progressActive() return ui.progress ~= nil end
+    function lib.cancelProgress() return emu:_cancelProgress(player, false) end
+
+    -- Menu contextuel : registerContext / showContext ; le test choisit avec p:selectMenu(index ou titre)
+    function lib.registerContext(context)
+        local list = context.id and { context } or context
+        for _, c in ipairs(list) do ui.contexts[c.id] = { def = c, env = env, resource = resource } end
+    end
+    function lib.showContext(id)
+        if not ui.contexts[id] then error('No context menu of such id found.', 2) end
+        ui.context = id
+        ui.contextLog[#ui.contextLog + 1] = { t = emu.now, id = id }
+    end
+    function lib.hideContext(onExit)
+        local c = ui.context and ui.contexts[ui.context]
+        ui.context = nil
+        if onExit and c and c.def.onExit then c.def.onExit() end
+    end
+    function lib.getOpenContextMenu() return ui.context end
+
+    -- Dialogues : bloquent le fil jusqu'à p:answerInput(valeurs | nil) / p:answerAlert('confirm' | 'cancel')
+    function lib.inputDialog(heading, rows, options)
+        if ui.input then return nil end
+        local norm = {}
+        for i, row in ipairs(rows) do norm[i] = type(row) == 'string' and { type = 'input', label = row } or row end
+        return emu:awaitCallback(function(done)
+            ui.input = { heading = heading, rows = norm, options = options, done = done, t = emu.now, resource = resource }
+        end)
+    end
+    function lib.closeInputDialog()
+        local dialog = ui.input
+        if dialog then ui.input = nil dialog.done(nil) end
+    end
+    function lib.alertDialog(data)
+        if ui.alert then return nil end
+        return emu:awaitCallback(function(done) ui.alert = { data = data, done = done, t = emu.now, resource = resource } end)
+    end
+    function lib.closeAlertDialog(reason)
+        local alert = ui.alert
+        if alert then ui.alert = nil alert.done(reason) end
+    end
+
+    function lib.showTextUI(text, options) ui.textUI = { text = text, options = options, t = emu.now, resource = resource } end
+    function lib.hideTextUI() ui.textUI = nil end
+    function lib.isTextUIOpen() return ui.textUI ~= nil, ui.textUI and ui.textUI.text end
+end
+
+-- Aides de test (p:menu(), p:selectMenu(), …) : ce que ferait le joueur dans l'interface ox_lib
+
+local function menuOptions(def)
+    local list, opts = {}, def.options or {}
+    if opts[1] ~= nil then
+        for _, o in ipairs(opts) do list[#list + 1] = o end
+    else
+        local keys = {}
+        for k in pairs(opts) do keys[#keys + 1] = k end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        for _, k in ipairs(keys) do
+            local o = opts[k]
+            if o.title == nil then o.title = k end
+            list[#list + 1] = o
+        end
+    end
+    return list
+end
+
+function Emu:_openMenu(p)
+    local c = p.ui.context and p.ui.contexts[p.ui.context]
+    if not c then return nil end
+    return { id = c.def.id, title = c.def.title, menu = c.def.menu, options = menuOptions(c.def) }
+end
+
+-- Choisit une option (index ou titre) : sous-menu (menu), sinon onSelect(args), event, serverEvent puis fermeture.
+-- Renvoie true, ou false + raison (no_menu, no_option, disabled, no_action)
+function Emu:_selectMenu(p, which)
+    local c = p.ui.context and p.ui.contexts[p.ui.context]
+    if not c then return false, 'no_menu' end
+    local list = menuOptions(c.def)
+    local o = type(which) == 'number' and list[which] or nil
+    if not o then for _, x in ipairs(list) do if x.title == which then o = x break end end end
+    if not o then return false, 'no_option' end
+    if o.disabled or o.readOnly then return false, 'disabled' end
+    if o.menu then
+        if not p.ui.contexts[o.menu] then return false, 'no_menu' end
+        p.ui.context = o.menu
+        p.ui.contextLog[#p.ui.contextLog + 1] = { t = self.now, id = o.menu }
+        return true
+    end
+    if not (o.onSelect or o.event or o.serverEvent) then return false, 'no_action' end
+    p.ui.context = nil
+    local env = c.env
+    self:_spawn(p.side, c.resource, function()
+        if o.onSelect then o.onSelect(o.args) end
+        if o.event then env.TriggerEvent(o.event, o.args) end
+        if o.serverEvent then env.TriggerServerEvent(o.serverEvent, o.args) end
+    end, true)
+    return true
+end
+
+-- Échap : ferme le menu et appelle onExit
+function Emu:_closeMenu(p)
+    local c = p.ui.context and p.ui.contexts[p.ui.context]
+    if not c then return false end
+    p.ui.context = nil
+    if c.def.onExit then self:_spawn(p.side, c.resource, c.def.onExit, true) end
+    return true
+end
+
+-- Valeurs par index de ligne ou par libellé ; nil = annuler. Contrôle required, min et max comme l'interface.
+function Emu:_answerInput(p, values)
+    local dialog = p.ui.input
+    if not dialog then return false, 'no_dialog' end
+    if values == nil then
+        p.ui.input = nil
+        dialog.done(nil)
+        return true
+    end
+    local out = {}
+    for i, row in ipairs(dialog.rows) do
+        local v = values[i]
+        if v == nil and row.label ~= nil then v = values[row.label] end
+        if v == nil then v = row.default end
+        if row.type == 'checkbox' then
+            if v == nil then v = row.checked == true end
+        elseif (row.type == 'number' or row.type == 'slider') and v ~= nil then
+            v = tonumber(v)
+            if v and ((row.min and v < row.min) or (row.max and v > row.max)) then
+                return false, ('hors limites : %s'):format(row.label or i)
+            end
+        end
+        if row.required and (v == nil or v == '') then return false, ('champ requis : %s'):format(row.label or i) end
+        out[i] = v
+    end
+    p.ui.input = nil
+    dialog.done(out)
+    return true
+end
+
+function Emu:_answerAlert(p, answer)
+    local alert = p.ui.alert
+    if not alert then return false, 'no_dialog' end
+    answer = answer or 'confirm'
+    if answer == 'cancel' and not alert.data.cancel then return false, 'no_cancel' end
+    p.ui.alert = nil
+    alert.done(answer)
+    return true
+end
+
+-- byPlayer = touche d'annulation du joueur : seulement si canCancel
+function Emu:_cancelProgress(p, byPlayer)
+    local pr = p.ui.progress
+    if not pr or (byPlayer and not pr.canCancel) then return false end
+    pr.cancelled = byPlayer and 'joueur' or 'script'
+    return true
 end
 
 return Emu

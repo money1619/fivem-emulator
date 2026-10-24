@@ -7,14 +7,16 @@ Il charge le vrai code de votre ressource (`fxmanifest.lua`, scripts serveur, pa
 - un côté **serveur**, et un côté **client par joueur émulé**, chacun avec ses propres environnements par ressource ;
 - une **horloge virtuelle** : `Wait`, `CreateThread`, `SetTimeout` suivent les ticks du serveur (10 ms) et les images du client (60 i/s par défaut) ; une minute de jeu se teste en une fraction de seconde ;
 - un **réseau par joueur** : latence (RTT), gigue, perte de paquets (retransmission), gel, et un mode chaos ; les événements restent fiables et ordonnés comme dans FiveM ; la taille des messages est estimée (msgpack) ;
-- des **mocks fidèles** d'ESX 1.12.4, oxmysql 2.12.0, ox_inventory 2.45.0 et ox_target 1.18.0, écrits à partir des sources de ces versions.
+- des **mocks fidèles** d'ESX 1.12.4, oxmysql 2.12.0, ox_inventory 2.45.0 et ox_target 1.18.0, écrits à partir des sources de ces versions ;
+- les **state bags** (`GlobalState`, `Player(id).state`, `Entity(ent).state`, `LocalPlayer.state`) répliqués sur le réseau émulé, et une bonne partie d'**ox_lib** (zones, points, `addCommand`, barres de progression, menus, dialogues) ;
+- un **audit anti-triche** (`emu:fuzz`) qui rejoue vos événements réseau comme un tricheur et signale ce qui rapporte de l'argent ou des objets.
 
 Vous écrivez un script de test qui ajoute des joueurs, tape des commandes, vise des zones ox_target, avance l'horloge, puis vérifie ce qui s'est passé (argent, inventaire, notifications, requêtes SQL, images dessinées, trafic réseau…).
 
 ## Limites (à lire avant de s'y fier)
 
 - **Pas de rendu GTA ni de physique GTA.** Les natives de dessin (`DrawMarker`, `DrawText`…) sont seulement enregistrées. Pas de collisions, pas de véhicules qui roulent, pas de raycast réel.
-- **Pas de OneSync réel.** Pas d'entités réseau partagées, pas de state bags (`GlobalState`, `Player(src).state`), pas de routage par bucket au-delà d'un simple champ.
+- **Pas de OneSync réel.** Pas d'entités réseau partagées ni de « scope » : tout ce qui est répliqué (state bags compris) arrive à tous les joueurs. `Entity(ent).state` utilise le numéro d'entité tel quel (pas de netId). Pas de routage par bucket au-delà d'un simple champ.
 - **Natives : seules les plus courantes sont simulées.** Une native absente provoque l'erreur Lua habituelle (`attempt to call a nil value (global 'X')`) et apparaît dans `emu:report()`. Ajoutez-la avec `emu:native(nom, fonction, côté)`.
 - **Syntaxe CfxLua : seulement les backticks** (`` `adder` `` → hash) **et les affectations composées** (`+=`, `-=`, `*=`, `/=`, `<<=`, `>>=`, `&=`, `|=`, `^=`), sur une seule ligne. **Pas de `?.`** (navigation sûre), pas de `in` pour déstructurer, pas de `defer`. Un fichier qui les utilise donne une erreur de syntaxe.
 - `exports` et `TriggerEvent` passent les tables par référence dans l'émulateur (FiveM les copie). Les données envoyées **sur le réseau** sont bien copiées, et les fonctions y sont refusées.
@@ -34,7 +36,7 @@ cd fivem-emulator
 lua5.4 tests/run.lua             # vérifie que tout marche
 ```
 
-Sous Windows, prenez un binaire Lua 5.4 ; la liste des fichiers d'une ressource utilise `dir`, le reste est du Lua pur.
+Sous Windows, prenez un binaire Lua 5.4 et lancez `lua tests/run.lua` ; la liste des fichiers d'une ressource utilise `dir`, le reste est du Lua pur.
 
 ## Démarrage rapide
 
@@ -82,6 +84,9 @@ Les dossiers `examples/` et `tests/` contiennent des scripts complets.
 | `emu:addAce(principal, objet, autoriser)`, `emu:addPrincipal(enfant, parent)` | ACL comme `add_ace` / `add_principal` (aussi utilisables avec `emu:command(nil, 'add_ace …')`). Le joueur est `player.<id>` et hérite de `identifier.<id>` pour chaque identifiant. Un refus l'emporte. |
 | `emu:command(nil, ligne)` | Commande tapée dans la console serveur (toujours autorisée). |
 | `emu:env(joueur \| nil, ressource)` | Environnement d'une ressource (serveur si `nil`) : pratique pour agir « depuis » une ressource, par exemple `emu:env(bob, 'shop').TriggerServerEvent('shop:buy', 'water')` pour simuler un tricheur. |
+| `emu:stateBag(nom, joueur?)` | Copie des valeurs d'un state bag vues par le serveur (ou par un joueur) : `emu:stateBag('global')`, `emu:stateBag('player:1', bob)`. |
+| `emu:fuzz(opts)` | Audit anti-triche des événements réseau serveur (voir plus bas). |
+| `emu:addProbe(nom, fn(joueur))` | Sonde de l'audit : renvoie `{ clé = nombre }` (argent, objets, points…). ESX et ox_inventory ont déjà la leur. |
 | `emu:report()` | Rapport texte : erreurs, avertissements, globales lues mais jamais définies (natives manquantes), trafic par joueur, lignes ajoutées par les mocks. |
 | `emu.errors`, `emu.warnings` | Erreurs Lua des fils (avec la pile d'appels) et avertissements (événement réseau non déclaré, commande inconnue…). |
 | `emu.server.log`, `joueur.side.log` | Lignes écrites par `print` côté serveur / client. |
@@ -99,6 +104,9 @@ Les dossiers `examples/` et `tests/` contiennent des scripts complets.
 | `p:frames(de, à)` | Images dessinées (regroupées par instant) avec leurs `DrawMarker`, `DrawLine`, `DrawRect`. |
 | `p:lastNotification(texte?)` | Dernière notification reçue (`lib.notify`, `ESX.ShowNotification`…), éventuellement contenant `texte`. |
 | `p:setPosition(x, y, z, cap)`, `p:kill()`, `p:enterVehicle()`, `p:drop(raison)` | État du joueur, déconnexion (`playerDropped` est déclenché pendant que `GetPlayerName` marche encore). |
+| `p:menu()`, `p:selectMenu(index ou titre)`, `p:closeMenu()` | Menu contextuel ox_lib ouvert, choix d'une option (`onSelect(args)`, `event`, `serverEvent`, sous-menu `menu`), Échap (`onExit`). Renvoie `true` ou `false, raison` (`no_menu`, `no_option`, `disabled`, `no_action`). |
+| `p:answerInput(valeurs \| nil)`, `p:answerAlert('confirm' \| 'cancel')` | Répond à `lib.inputDialog` (valeurs par rang ou par libellé ; `required`, `min`, `max` contrôlés ; `nil` = annuler) ou à `lib.alertDialog`. |
+| `p:progress()`, `p:cancelProgress()`, `p:textUI()` | Barre de progression en cours, annulation par le joueur (seulement si `canCancel`), TextUI affiché. |
 | `p.notifications`, `p.nui`, `p.nuiFocus`, `p.entities`, `p.draws`, `p.texts`, `p.received`, `p.net` | Ce que le client a reçu, affiché ou créé. |
 
 ### Ce que voient les scripts
@@ -108,9 +116,58 @@ Les dossiers `examples/` et `tests/` contiennent des scripts complets.
 - `exports.res:fn(...)` et `exports['res']['fn'](self, ...)` : comme FiveM, le premier argument (`self`) est ignoré. `GetInvokingResource()` donne la ressource appelante.
 - Natives présentes (principales) : fils (`Wait`, `CreateThread`, `SetTimeout`, `ClearTimeout`, `Citizen.*`, `promise`, `Citizen.Await`), événements, exports, commandes (`RegisterCommand`, `ExecuteCommand`), joueurs côté serveur (`GetPlayers`, `GetPlayerName`, identifiants, `IsPlayerAceAllowed`, `DropPlayer`, bucket, coordonnées et cap du ped), côté client (`PlayerPedId`, coordonnées, santé, véhicule, contrôles, dessin, texte, NUI, entités locales avec `CreateObject` / `CreatePed` / `CreateVehicle`), `GetHashKey` / `joaat`, `json`, vecteurs (`vector2/3/4`, `vec`, `#v`, `.xy`, `type(v) == 'vector3'`), `GetConvar`, `LoadResourceFile`.
 
+### State bags
+
+Comme dans FiveM :
+
+- `GlobalState.x = v` et `Player(src).state.x = v` côté serveur répliquent vers tous les joueurs (`state:set(clé, valeur, false)` pour garder une valeur côté serveur) ; la valeur arrive chez chaque joueur avec sa latence ;
+- côté client, `state.x = v` reste **local** ; `LocalPlayer.state:set(clé, valeur, true)` envoie la valeur au serveur, puis aux autres joueurs. Un client ne peut répliquer que **son propre** sac : une écriture répliquée dans `GlobalState` ou le sac d'un autre est refusée et signalée dans `emu.warnings` ;
+- la valeur est **copiée** à l'écriture et à chaque lecture (`state.config.prix = 1` ne change rien) ;
+- `AddStateBagChangeHandler(clé, sac, fn(nomDuSac, clé, valeur, _, répliqué))` est appelé **avant** le changement : lire `state.x` dans le gestionnaire donne encore l'ancienne valeur. Aussi : `RemoveStateBagChangeHandler(cookie)`, `GetPlayerFromStateBagName` (id serveur côté serveur, index de joueur côté client), `GetEntityFromStateBagName`, `GetStateBagValue`, `GetStateBagKeys`, `StateBagHasKey` ;
+- un joueur qui arrive reçoit l'état déjà répliqué (sans déclencher les gestionnaires) ; le sac d'un joueur disparaît à sa déconnexion.
+
+Attention à ce qu'un client peut écrire dans son propre sac : le serveur ne doit jamais faire confiance à `Player(src).state` pour de l'argent ou des droits.
+
 ### ox_lib (fourni d'office)
 
-`@ox_lib/init.lua` donne : `lib.callback` / `lib.callback.await` / `lib.callback.register` (aller-retour sur le réseau émulé, dans les deux sens), `lib.notify` (client : enregistré ; serveur : `lib.notify(joueur, données)` envoie au client), `lib.print`, `locale`, et `cache` (`ped`, `playerId`, `serverId`, `resource`). Le reste d'ox_lib (zones, points, menus, progressBar…) n'est pas fourni.
+`@ox_lib/init.lua` donne :
+
+- `lib.callback` / `lib.callback.await` / `lib.callback.register` (aller-retour sur le réseau émulé, dans les deux sens), `lib.notify` (client : enregistré ; serveur : `lib.notify(joueur, données)` envoie au client), `lib.print`, `locale`, et `cache` (`ped`, `playerId`, `serverId`, `resource`) ;
+- **zones** (client) : `lib.zones.sphere` (rayon 2 par défaut), `lib.zones.box` (taille, rotation en degrés), `lib.zones.poly` (points, épaisseur 4), avec `onEnter`, `onExit` et `inside`, `zone:remove()`, `zone:contains(coords)`, et vos propres champs dans `self`. Entrées et sorties vérifiées toutes les 300 ms, `inside` à chaque image, comme ox_lib ; déplacez le joueur avec `p:setPosition` ;
+- **points** (client) : `lib.points.new({ coords, distance, onEnter, onExit, nearby })`, `currentDistance`, `isClosest`, `point:remove()` ;
+- **`lib.addCommand`** (serveur) : paramètres typés (`number`, `string`, `playerId` avec `me`, `longString`, `optional`), `restricted = 'group.admin'` (ajoute l'ACE comme ox_lib). Un argument invalide écrit le message d'ox_lib dans la console et la commande ne s'exécute pas ;
+- **interface** (client) : `lib.progressBar` / `lib.progressCircle` (bloquent le fil, renvoient `true` à la fin ou `false` si annulées : `p:cancelProgress()`, `lib.cancelProgress()`, ou mort sans `useWhileDead`), `lib.registerContext` / `showContext` / `hideContext`, `lib.inputDialog`, `lib.alertDialog`, `lib.showTextUI` / `hideTextUI` ; le test joue le rôle du joueur avec `p:selectMenu`, `p:answerInput`, `p:answerAlert` ;
+- **outils** : `lib.waitFor`, `lib.table` (`contains`, `matches`, `deepclone`, `merge`), `lib.getClosestPlayer` / `lib.getNearbyPlayers` (client et serveur), `lib.requestModel` et autres `lib.request*` (déjà chargés), `lib.addAce` / `lib.addPrincipal`.
+
+Non fournis : `lib.registerMenu` (menu liste), `lib.skillCheck`, `lib.getVehicleProperties`, `lib.class`, `lib.timer`, `lib.disableControls`…
+
+### Audit anti-triche (`emu:fuzz`)
+
+À lancer **à la fin** d'un test, une fois le trafic normal joué (achats, ventes, commandes…) :
+
+```lua
+local audit = emu:fuzz()          -- ou emu:fuzz({ resources = { 'ma_ressource' }, events = { 'shop:buy' } })
+print(audit:text())
+T:eq(audit:count('critique'), 0, 'aucune faille critique')
+```
+
+Pour chaque événement réseau serveur de vos ressources (`RegisterNetEvent` et `lib.callback.register`), l'audit reprend les vrais appels observés pendant le test (ou des appels vides si l'événement n'a jamais été déclenché) et les renvoie depuis le joueur, comme le ferait un exécuteur Lua :
+
+- chaque argument, et chaque champ d'un argument table, remplacé par `nil`, `-1`, `0`, `-100000`, `1e9`, `2^31`, `0.5`, `NaN`, `inf`, `''`, une chaîne de 10 Ko, une injection SQL, `{}`, `true`, l'id d'un autre joueur ;
+- l'appel normal 10 fois en rafale ;
+- l'appel normal depuis 10 km.
+
+Des sondes mesurent l'argent et les objets de chaque joueur avant et après chaque tentative, et le résultat est comparé à l'appel normal :
+
+| Gravité | Signalé quand |
+|---|---|
+| `critique` | le tricheur gagne plus qu'avec l'appel normal (ou obtient la même chose en payant moins), un autre joueur perd quelque chose, une valeur devient `NaN` ou infinie, ou le texte piégé arrive tel quel dans une requête SQL (oxmysql) |
+| `attention` | 10 envois rapportent 10 fois (pas d'anti-spam), ou le même gain est obtenu à 10 km (position pas vérifiée) |
+| `info` | une valeur piégée provoque une erreur Lua côté serveur (argument non vérifié) |
+
+`audit.findings` liste `{ severity, event, kind, detail, args }`, `audit:count(gravité)` les compte, `audit:text()` les affiche. Un tricheur expulsé (`DropPlayer`) ou dont l'argent est devenu `NaN` est remplacé par un nouveau joueur identique. Les erreurs Lua provoquées par l'audit sont rangées dans le résultat, pas dans `emu.errors`. Options : `resources`, `events`, `skip`, `player`, `settle` (attente après chaque envoi), `spam` (10), `maxCalls` (2 appels observés par événement).
+
+L'audit ne voit que ce que mesurent les sondes : ajoutez les vôtres pour d'autres ressources (`emu:addProbe('xp', function(p) return { xp = monXp[p.id] } end)`). Il ne remplace pas une relecture du code : il trouve vite les oublis classiques.
 
 ### Petit outil de vérification
 
@@ -214,7 +271,7 @@ local ok2, raison = target:select(bob, 'boutique:eau', { coords = { x = 1, y = 2
   ok     Bob déconnecté ne reçoit plus rien
   ok     aucune erreur
 
-fivem_emu 0.2.0 — t = 9.5 s virtuelles, 3 joueur(s)
+fivem_emu 0.3.0 — t = 9.5 s virtuelles, 3 joueur(s)
 erreurs : 0
 TriggerClientEvent vers tous (-1) : 3 fois
 joueur 1 (Alice, RTT 30 ms) : reçu 4 paquets / 0.1 Ko, envoyé 3 / 0.1 Ko, 60 dessins, 0 entités locales restantes
@@ -247,7 +304,7 @@ joueur 3 (Carol, RTT 90 ms) : reçu 5 paquets / 0.2 Ko, envoyé 2 / 0.1 Ko, 30 d
   ok     deux ventes enregistrées
   ok     aucune erreur
 
-fivem_emu 0.2.0 — t = 4.3 s virtuelles, 2 joueur(s)
+fivem_emu 0.3.0 — t = 4.3 s virtuelles, 2 joueur(s)
 erreurs : 0
 joueur 1 (Alice, RTT 40 ms) : reçu 16 paquets / 2.1 Ko, envoyé 5 / 0.3 Ko, 0 dessins, 0 entités locales restantes
 joueur 2 (Bob, RTT 150 ms) : reçu 3 paquets / 0.8 Ko, envoyé 2 / 0.0 Ko, 0 dessins, 0 entités locales restantes
@@ -256,10 +313,24 @@ oxmysql (simulé) : 3 requête(s), 0 sans réponse prévue
 18 vérifications : 18 réussies, 0 échouées
 ```
 
+`lua5.4 examples/demo_audit_test.lua` (ressource `examples/resources/demo_faille`, **volontairement mal protégée**) :
+
+```
+Audit anti-triche : 4 événement(s), 66 tentative(s), 3 critique(s), 2 attention, 1 info
+  CRITIQUE  faille:journal — injection SQL (argument 1) : requête envoyée : INSERT INTO faille_journal (message) VALUES ('emu' OR '1'='1')
+  CRITIQUE  faille:virement — gain (argument 2) : valeur -1 → esx:bank +1 (appel normal : -50)
+  CRITIQUE  faille:virement — perte pour un autre joueur (argument 2) : valeur -1 → joueur 2 : esx:bank -1 (appel normal : +50)
+  ATTENTION faille:recompense — aucun contrôle de distance : même effet à 10 km de la position du test
+  ATTENTION faille:recompense — pas d'anti-spam : 10 envois en rafale : esx:bank +1000 (1 envoi : +100)
+  INFO      faille:virement — erreur Lua (argument 2) : valeur -100000 → … Tried To Set Account bank For Player 2 To An Invalid Number …
+```
+
+L'événement `faille:don`, qui vérifie son montant (entier, positif, plafonné) et le solde, ne ressort pas.
+
 `lua5.4 tests/run.lua` lance les tests de l'émulateur et des mocks (ajoutez `-v` pour voir chaque vérification) ; il se termine par :
 
 ```
-200 vérifications : 200 réussies, 0 échouées
+265 vérifications : 265 réussies, 0 échouées
 ```
 
 ## Organisation du dépôt
@@ -267,7 +338,7 @@ oxmysql (simulé) : 3 requête(s), 0 sans réponse prévue
 ```
 fivem_emu.lua                 l'émulateur (un seul fichier)
 mocks/                        esx.lua, oxmysql.lua, ox_inventory.lua, ox_target.lua
-examples/                     demo_ping_test.lua, demo_boutique_test.lua et leurs ressources
+examples/                     demo_ping_test.lua, demo_boutique_test.lua, demo_audit_test.lua et leurs ressources
 tests/run.lua                 tests de l'émulateur et des mocks (ressources de test dans tests/fixtures)
 ```
 

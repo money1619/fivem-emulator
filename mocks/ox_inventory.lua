@@ -836,6 +836,14 @@ return function(emu, opts)
     -- Aides pour les tests
     local function id(p) return type(p) == 'table' and (p.id or p) or p end
     function mock:inventory(p) return Inventory(id(p)) end
+    -- Sonde pour emu:fuzz : nombre de chaque objet du joueur
+    emu:addProbe('ox_inventory', function(player)
+        local inv = Inventory(player.id)
+        if not inv then return nil end
+        local r = {}
+        for _, item in pairs(inv.items) do r[item.name] = (r[item.name] or 0) + item.count end
+        return r
+    end)
     function mock:count(p, name, metadata, strict) return Inventory.GetItemCount(id(p), name, metadata, strict) end
     function mock:clientCount(player, name)
         local n = 0

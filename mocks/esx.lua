@@ -1210,6 +1210,18 @@ return function(emu, opts)
         emu:_env(player.side, 'es_extended').TriggerServerEvent('esx:useItem', itemName)
     end
 
+    -- Sonde pour emu:fuzz : comptes du joueur, et inventaire ESX d'origine (en mode ox, la sonde d'ox_inventory compte)
+    emu:addProbe('esx', function(player)
+        local xPlayer = mock.ESX and mock.ESX.Players[player.id]
+        if not xPlayer then return nil end
+        local r = {}
+        for _, account in ipairs(xPlayer.accounts or {}) do r[account.name] = account.money end
+        if not mock.ox then
+            for _, item in ipairs(xPlayer.inventory or {}) do if item.count ~= 0 then r['item:' .. item.name] = item.count end end
+        end
+        return r
+    end)
+
     if opts.autostart ~= false then emu:start('es_extended') end
     return mock
 end
