@@ -9,7 +9,7 @@
 -- apparaissent dans le rapport ; on les ajoute avec emu:native().
 local Emu = {}
 Emu.__index = Emu
-Emu.VERSION = '0.3.1'
+Emu.VERSION = '0.3.2'
 
 local unpack = table.unpack
 
@@ -418,8 +418,106 @@ local function replaceHashes(src)
     return table.concat(out)
 end
 
+-- Copie du source où chaînes et commentaires sont remplacés par des espaces (retours à la ligne gardés)
+local function codeMask(src)
+    local out, i, n = {}, 1, #src
+    local function blank(s) return (s:gsub('[^\n]', ' ')) end
+    while i <= n do
+        local c = src:sub(i, i)
+        local stop
+        if c == '-' and src:sub(i, i + 1) == '--' then
+            local level = src:match('^%-%-%[(=*)%[', i)
+            if level then stop = select(2, src:find(']' .. level .. ']', i, true)) or n
+            else stop = (src:find('\n', i, true) or n + 1) - 1 end
+        elseif c == '[' and src:match('^%[=*%[', i) then
+            local level = src:match('^%[(=*)%[', i)
+            stop = select(2, src:find(']' .. level .. ']', i, true)) or n
+        elseif c == '"' or c == "'" then
+            local j = i + 1
+            while j <= n do
+                local d = src:sub(j, j)
+                if d == '\\' then j = j + 2 elseif d == c or d == '\n' then break else j = j + 1 end
+            end
+            stop = math.min(j, n)
+        end
+        if stop then
+            out[#out + 1] = blank(src:sub(i, stop))
+            i = stop + 1
+        else
+            local j = src:find('[%-%[\'"]', i + 1) or n + 1
+            out[#out + 1] = src:sub(i, j - 1)
+            i = j
+        end
+    end
+    return table.concat(out)
+end
+
+-- Navigation sûre CfxLua : a?.b, a?[k], a?:m() → __emu_safe(a).b … (__emu_safe(nil) = table vide)
+local SAFE_HEADER = 'local __emu_safe=(function() local N=setmetatable({},{__index=function() return nil end,'
+    .. '__newindex=function() end}) return function(v) if v==nil then return N end return v end end)();'
+local function rewriteSafeNav(src)
+    if not src:find('?', 1, true) then return src end
+    local changed = false
+    while true do
+        local mask = codeMask(src)
+        local q = mask:find('%?[%.%[:]')
+        if not q then break end
+        -- début de l'expression préfixe qui précède « ? »
+        local j = q - 1
+        local start = q
+        while j >= 1 do
+            local c = mask:sub(j, j)
+            if c == ')' or c == ']' then
+                local open = c == ')' and '(' or '['
+                local depth, k = 0, j
+                while k >= 1 do
+                    local d = mask:sub(k, k)
+                    if d == c then depth = depth + 1 elseif d == open then depth = depth - 1 if depth == 0 then break end end
+                    k = k - 1
+                end
+                if k < 1 then break end
+                start = k
+                j = k - 1
+                local p = mask:sub(j, j)
+                if not (p:match('[%w_%)%]]')) then break end
+            elseif c:match('[%w_]') then
+                local k = j
+                while k >= 1 and mask:sub(k, k):match('[%w_]') do k = k - 1 end
+                start = k + 1
+                j = k
+                local p = mask:sub(j, j)
+                if (p == '.' and mask:sub(j - 1, j - 1) ~= '.') or p == ':' then j = j - 1 else break end
+            else
+                break
+            end
+        end
+        if start >= q then break end   -- rien de reconnu : laissé tel quel (erreur de syntaxe normale)
+        src = src:sub(1, start - 1) .. '__emu_safe(' .. src:sub(start, q - 1) .. ')' .. src:sub(q + 1)
+        changed = true
+    end
+    if changed then src = SAFE_HEADER .. src end
+    return src
+end
+
+-- Commentaires C de CfxLua (/* … */) : remplacés par des espaces (retours à la ligne gardés)
+local function stripCComments(src)
+    if not src:find('/*', 1, true) then return src end
+    local mask = codeMask(src)
+    local out, i = {}, 1
+    while true do
+        local s = mask:find('/*', i, true)
+        if not s then break end
+        local e = select(2, mask:find('*/', s + 2, true)) or #src
+        out[#out + 1] = src:sub(i, s - 1)
+        out[#out + 1] = (src:sub(s, e):gsub('[^\n]', ' '))
+        i = e + 1
+    end
+    out[#out + 1] = src:sub(i)
+    return table.concat(out)
+end
+
 local function preprocess(src)
-    src = replaceHashes(src)
+    src = rewriteSafeNav(stripCComments(replaceHashes(src)))
     local out = {}
     for line in (src .. '\n'):gmatch('(.-)\n') do
         if line:find('[%+%-%*/&|%^<>]=') then
@@ -911,7 +1009,16 @@ function Emu:_nativesFor(side, resource, env)
         CreateThreadNow = function(fn) emu:_spawn(side, resource, fn, true) end,
         Await = citizenAwait,
         Trace = function(s) side.log[#side.log + 1] = tostring(s) end,
+        -- appels de natives par hash : non émulés (renvoient nil) ; marqueurs de type de résultat
+        InvokeNative = function() return nil end,
+        ResultAsString = function() return 'string' end, ResultAsInteger = function() return 'integer' end,
+        ResultAsFloat = function() return 'float' end, ResultAsVector = function() return 'vector' end,
+        ResultAsLong = function() return 'long' end, ResultAsObject = function() return 'object' end,
+        PointerValueInt = function() return 0 end, PointerValueFloat = function() return 0.0 end,
+        PointerValueVector = function() return 0 end,
     }
+    N.msgpack = N.msgpack or { pack = function(...) return json.encode(table.pack(...)) end,
+                                unpack = function(s) local t = json.decode(s) or {} return table.unpack(t, 1, t.n or #t) end }
     N.GetGameTimer = function() return math.floor(emu.now + (side.player and side.player.clockOffset or 0)) end
     N.GetCurrentResourceName = function() return resource end
     N.GetInvokingResource = function() return side.invoking end
@@ -919,6 +1026,48 @@ function Emu:_nativesFor(side, resource, env)
         if emu.started[name] then return 'started' end
         return emu.resources[name] and 'stopped' or 'missing'
     end
+    N.GetResourcePath = function(name)
+        local r = emu.resources[name]
+        return r and (r.dir or ('virtual/' .. name)) or nil
+    end
+    -- KVP en mémoire, par ressource et par côté (le serveur et chaque client ont le leur)
+    side.kvp = side.kvp or {}
+    side.kvp[resource] = side.kvp[resource] or {}
+    local kvp = side.kvp[resource]
+    N.SetResourceKvp = function(k, v) kvp[k] = tostring(v) end
+    N.SetResourceKvpInt = function(k, v) kvp[k] = math.tointeger(v) or math.floor(tonumber(v) or 0) end
+    N.SetResourceKvpFloat = function(k, v) kvp[k] = tonumber(v) or 0.0 end
+    N.SetResourceKvpNoSync, N.SetResourceKvpIntNoSync, N.SetResourceKvpFloatNoSync = N.SetResourceKvp, N.SetResourceKvpInt, N.SetResourceKvpFloat
+    N.GetResourceKvpString = function(k) local v = kvp[k] return type(v) == 'string' and v or nil end
+    N.GetResourceKvpInt = function(k) local v = kvp[k] return math.type(v) == 'integer' and v or 0 end
+    N.GetResourceKvpFloat = function(k) local v = kvp[k] return type(v) == 'number' and v + 0.0 or 0.0 end
+    N.DeleteResourceKvp = function(k) kvp[k] = nil end
+    N.DeleteResourceKvpNoSync = N.DeleteResourceKvp
+    N.FlushResourceKvp = function() end
+    N.StartFindKvp = function(prefix)
+        local keys = {}
+        for k in pairs(kvp) do if k:sub(1, #prefix) == prefix then keys[#keys + 1] = k end end
+        table.sort(keys)
+        return { keys = keys, i = 0 }
+    end
+    N.FindKvp = function(h) h.i = h.i + 1 return h.keys[h.i] end
+    N.EndFindKvp = function() end
+    if side.kind == 'server' then
+        N.GetNumPlayerTokens = function() return 0 end
+        N.GetPlayerToken = function() return nil end
+    end
+    -- load comme dans FiveM : syntaxe CfxLua acceptée, environnement de la ressource par défaut
+    N.load = function(chunk, chunkname, mode, fenv)
+        if type(chunk) == 'string' then chunk = preprocess(chunk) end
+        return load(chunk, chunkname, mode or 't', fenv or env)
+    end
+    -- Pas de réseau : chaque requête HTTP échoue (code 0) au tick suivant
+    N.PerformHttpRequest = function(url, cb)
+        if type(cb) == 'function' then
+            emu:at(emu:_nextTick(side, 0), function() emu:_spawn(side, resource, function() cb(0, nil, {}, 'emu: pas de réseau') end, false) end)
+        end
+    end
+    N.PerformHttpRequestAwait = function() return 0, nil, {} end
     N.GetHashKey = joaat
     N.joaat = joaat
     N.json = json
@@ -1099,6 +1248,7 @@ function Emu:_nativesFor(side, resource, env)
     else
         local player = side.player
         N.IsDuplicityVersion = function() return false end
+        N.RegisterKeyMapping = function(command, description, mapper, key) side.keyMappings = side.keyMappings or {} side.keyMappings[command] = { description = description, mapper = mapper, key = key } end
         N.LocalPlayer = N.Player(player.id)
         N.TriggerServerEvent = function(name, ...)
             local args = table.pack(...)
@@ -1357,11 +1507,19 @@ function Emu:_runSideScripts(side, res, kinds)
             for _, item in ipairs(self:_expand(res, entry)) do
                 if item.include then
                     local provider = self.providers[item.include]
+                    local other, rel = item.include:match('^@([^/]+)/(.+)$')
+                    local otherRes = other and self.resources[other]
                     if provider then
                         provider(self:_env(side, res.name), side, self)
+                    elseif otherRes and otherRes.dir and rel:match('%.lua$') then
+                        -- vrai fichier d'une autre ressource chargée (emu:loadResource), exécuté chez celle-ci
+                        self:_loadScript(side, res.name, otherRes.dir .. '/' .. rel, '@' .. other .. '/' .. rel)
                     else
                         self:_warn(('%s : inclusion %s non fournie (emu:provide), ignorée'):format(res.name, item.include))
                     end
+                elseif not item.rel:lower():match('%.lua$') then
+                    -- JavaScript, C# (.dll) : autres moteurs de FiveM, non émulés
+                    self:_warn(('%s : %s ignoré (seul le Lua est émulé)'):format(res.name, item.rel))
                 else
                     self:_loadScript(side, res.name, item.path, res.name .. '/' .. item.rel)
                 end
@@ -2259,7 +2417,99 @@ function Emu:_installDefaultProviders()
         env.cache = { resource = resource, game = 'fivem', playerId = side.player and side.player.id - 1,
                       serverId = side.player and side.player.id, ped = side.player and side.player.ped }
         emu:_oxlibExtras(lib, env, side, resource)
+        emu:_oxlibModules(lib, env, side, resource)
     end)
+end
+
+-- ox_lib : lib.load / lib.loadJson / lib.require (et require global), lib.class, lib.checkDependency,
+-- lib.versionCheck. Les fichiers sont lus dans la ressource (« @autre/chemin » pour une autre ressource),
+-- comme imports/require/shared.lua d'ox_lib : 'a.b' → a/b.lua ou a/b/init.lua.
+function Emu:_oxlibModules(lib, env, side, resource)
+    local emu = self
+    local loaded = {}
+    local function locate(modname)
+        local res, path = resource, modname
+        local other, rest = modname:match('^@([^/%.]+)[/%.](.+)$')
+        if other then res, path = other, rest end
+        path = path:gsub('%.lua$', ''):gsub('%.', '/')
+        local r = emu.resources[res]
+        if not r or not r.dir then return nil end
+        for _, cand in ipairs({ path .. '.lua', path .. '/init.lua' }) do
+            local src = readFile(r.dir .. '/' .. cand)
+            if src then return src, ('%s/%s'):format(res, cand) end
+        end
+    end
+    function lib.load(modname, fenv)
+        local src, display = locate(modname)
+        if not src then error(('cannot load file at path \'%s\''):format(modname), 2) end
+        local chunk, err = load(preprocess(src), '@' .. display, 't', fenv or env)
+        if not chunk then error(err, 2) end
+        return chunk()
+    end
+    function lib.loadJson(modname)
+        local res, path = resource, modname
+        local other, rest = modname:match('^@([^/%.]+)[/%.](.+)$')
+        if other then res, path = other, rest end
+        local r = emu.resources[res]
+        local src = r and r.dir and readFile(r.dir .. '/' .. path:gsub('%.', '/') .. '.json')
+        if not src then error(('cannot load json file at path \'%s\''):format(modname), 2) end
+        return json.decode(src)
+    end
+    function lib.require(modname)
+        if loaded[modname] ~= nil then return loaded[modname] end
+        local src, display = locate(modname)
+        if not src then
+            local ok, m = pcall(require, modname)   -- modules Lua purs (string, table…) ou package.path
+            if ok then return m end
+            error(('module \'%s\' not found'):format(modname), 2)
+        end
+        local chunk, err = load(preprocess(src), '@' .. display, 't', env)
+        if not chunk then error(err, 2) end
+        local v = chunk(modname)
+        if v == nil then v = true end
+        loaded[modname] = v
+        return v
+    end
+    env.require = lib.require
+    -- Vrai seulement si la ressource est démarrée dans l'émulateur (la version n'est pas comparée)
+    function lib.checkDependency(name) return emu.started[name] == true end
+    function lib.versionCheck() end
+    -- SetInterval / ClearInterval globaux d'ox_lib (init.lua)
+    local intervals, nextInterval = {}, 0
+    function env.SetInterval(callback, interval, ...)
+        interval = interval or 0
+        local args = table.pack(...)
+        local id
+        if type(callback) == 'number' and intervals[callback] then
+            intervals[callback].interval = interval
+            return callback
+        end
+        nextInterval = nextInterval + 1
+        id = nextInterval
+        intervals[id] = { interval = interval }
+        env.CreateThread(function()
+            while intervals[id] do
+                callback(unpack(args, 1, args.n))
+                env.Wait(intervals[id] and intervals[id].interval or 0)
+            end
+        end)
+        return id
+    end
+    function env.ClearInterval(id) intervals[id] = nil end
+    function lib.class(name, super)
+        local class = { __name = name }
+        class.__index = class
+        if super then setmetatable(class, { __index = super }) end
+        function class.new(_, ...)
+            local obj = setmetatable({}, class)
+            if obj.constructor then obj:constructor(...) end
+            return obj
+        end
+        function class.super(self, ...)
+            if super and super.constructor then return super.constructor(self, ...) end
+        end
+        return class
+    end
 end
 
 -------------------------------------------------------------------------------

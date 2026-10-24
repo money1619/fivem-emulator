@@ -1061,5 +1061,38 @@ do
     T:check(not found(r2, 'at:debut', 'durée'), 'durée vérifiée côté serveur : rien à signaler', r2:text())
 end
 
+-------------------------------------------------------------------------------
+T:section('CfxLua, modules ox_lib, KVP, inclusions réelles')
+-------------------------------------------------------------------------------
+do
+    local emu = Emu.new()
+    require('mocks.esx')(emu)
+    emu:loadResource(root .. '/tests/fixtures/lib_partagee')
+    emu:loadResource(root .. '/tests/fixtures/cfxlua')
+    emu:start('lib_partagee')
+    emu:start('cfxlua')
+    local p = emu:addPlayer({ name = 'Alice' })
+    emu:run(1000)
+    local S = emu:env(nil, 'cfxlua')
+    local R = S.Resultats
+    T:same(R.nav, { 7, nil, nil, 7, '?.' }, 'navigation sûre a?.b, a?[k], chaîne « ?. » intacte')
+    T:eq(R.calc, 5, 'lib.require : dossier/init.lua')
+    T:eq(R.donnees, 42, 'lib.load : fichier de la ressource')
+    T:check(R.memeModule, 'require global = lib.require, module mis en cache')
+    T:eq(R.charge, 5, 'load : syntaxe CfxLua et environnement de la ressource')
+    T:eq(R.outils, 8, 'inclusion @lib_partagee/outils.lua : vrai fichier de l\'autre ressource')
+    T:eq(R.texte, 'Atelier', '_U (TranslateCap) avec Config.Locale')
+    T:eq(R.format, 'bonjour Max', '_ (Translate) avec arguments')
+    T:check(R.dep == true and R.absente == false, 'lib.checkDependency : vrai seulement si la ressource tourne')
+    T:check(R.chemin, 'GetResourcePath')
+    T:same({ R.kvpInt, R.kvpTexte, R.kvpAbsent, R.kvpTrouve }, { 3, 'aeom', 0, 'compteur' }, 'KVP en mémoire et recherche par préfixe')
+    T:eq(S.Ticks, 6, 'SetInterval toutes les 100 ms, ClearInterval à 550 ms')
+    T:eq(R.http, 0, 'PerformHttpRequest : pas de réseau, code 0')
+    T:eq(R.classe, 9, 'lib.class : constructeur')
+    T:check(hasText(emu.warnings, 'web/inutile.js ignoré'), 'script JavaScript ignoré avec un avertissement', emu.warnings)
+    T:eq(p.side.keyMappings and p.side.keyMappings.ouvrir and p.side.keyMappings.ouvrir.key, 'F5', 'RegisterKeyMapping enregistré')
+    T:eq(#emu.errors, 0, 'aucune erreur Lua', emu.errors[1] and emu.errors[1].message)
+end
+
 local allOk = T:summary()
 os.exit(allOk and 0 or 1)

@@ -18,7 +18,7 @@ Vous écrivez un script de test qui ajoute des joueurs, tape des commandes, vise
 - **Pas de rendu GTA ni de physique GTA.** Les natives de dessin (`DrawMarker`, `DrawText`…) sont seulement enregistrées. Pas de collisions, pas de véhicules qui roulent, pas de raycast réel.
 - **Pas de OneSync réel.** Pas d'entités réseau partagées ni de « scope » : tout ce qui est répliqué (state bags compris) arrive à tous les joueurs. `Entity(ent).state` utilise le numéro d'entité tel quel (pas de netId). Pas de routage par bucket au-delà d'un simple champ.
 - **Natives : seules les plus courantes sont simulées.** Une native absente provoque l'erreur Lua habituelle (`attempt to call a nil value (global 'X')`) et apparaît dans `emu:report()`. Ajoutez-la avec `emu:native(nom, fonction, côté)`.
-- **Syntaxe CfxLua : seulement les backticks** (`` `adder` `` → hash) **et les affectations composées** (`+=`, `-=`, `*=`, `/=`, `<<=`, `>>=`, `&=`, `|=`, `^=`), sur une seule ligne. **Pas de `?.`** (navigation sûre), pas de `in` pour déstructurer, pas de `defer`. Un fichier qui les utilise donne une erreur de syntaxe.
+- **Syntaxe CfxLua : seulement les backticks** (`` `adder` `` → hash) **les affectations composées** (`+=`, `-=`, `*=`, `/=`, `<<=`, `>>=`, `&=`, `|=`, `^=`), sur une seule ligne, **la navigation sûre** (`a?.b`, `a?[k]`, `a?:m()`) **et les commentaires C** (`/* … */`). Pas de `in` pour déstructurer, pas de `defer`. Un fichier qui les utilise donne une erreur de syntaxe. `load` passe aussi par cette conversion et s'exécute par défaut dans l'environnement de la ressource, comme dans FiveM.
 - `exports` et `TriggerEvent` passent les tables par référence dans l'émulateur (FiveM les copie). Les données envoyées **sur le réseau** sont bien copiées, et les fonctions y sont refusées.
 - Les mocks ne couvrent que ce qui est décrit plus bas. Exemples de choses non simulées : base de données réelle, paie ESX, menus `ESX.UI`, `ESX.Game`, armes ESX d'origine, boutiques/fouilles/dépôts au sol d'ox_inventory, raycast et os (bones) d'ox_target.
 - Les messages d'erreur imités d'ESX et d'oxmysql restent en anglais, comme dans la console FiveM.
@@ -114,7 +114,8 @@ Les dossiers `examples/` et `tests/` contiennent des scripts complets.
 - `source` vaut l'id du joueur (nombre) dans un événement réseau reçu par le serveur, `65535` dans un événement reçu du serveur par un client, `''` dans un événement local. Comme dans FiveM, `source` est remis à sa valeur précédente dès que le gestionnaire appelle `Wait` : lisez-le au début (`local src = source`).
 - `RegisterNetEvent` vaut **par ressource** : un `AddEventHandler` seul ne reçoit pas les événements réseau. Un événement réseau non déclaré est ignoré et signalé dans `emu.warnings`.
 - `exports.res:fn(...)` et `exports['res']['fn'](self, ...)` : comme FiveM, le premier argument (`self`) est ignoré. `GetInvokingResource()` donne la ressource appelante.
-- Natives présentes (principales) : fils (`Wait`, `CreateThread`, `SetTimeout`, `ClearTimeout`, `Citizen.*`, `promise`, `Citizen.Await`), événements, exports, commandes (`RegisterCommand`, `ExecuteCommand`), joueurs côté serveur (`GetPlayers`, `GetPlayerName`, identifiants, `IsPlayerAceAllowed`, `DropPlayer`, bucket, coordonnées et cap du ped), côté client (`PlayerPedId`, coordonnées, santé, véhicule, contrôles, dessin, texte, NUI, entités locales avec `CreateObject` / `CreatePed` / `CreateVehicle`), `GetHashKey` / `joaat`, `json`, vecteurs (`vector2/3/4`, `vec`, `#v`, `.xy`, `type(v) == 'vector3'`), `GetConvar`, `LoadResourceFile`.
+- Natives présentes (principales) : fils (`Wait`, `CreateThread`, `SetTimeout`, `ClearTimeout`, `Citizen.*`, `promise`, `Citizen.Await`), événements, exports, commandes (`RegisterCommand`, `ExecuteCommand`), joueurs côté serveur (`GetPlayers`, `GetPlayerName`, identifiants, `IsPlayerAceAllowed`, `DropPlayer`, bucket, coordonnées et cap du ped), côté client (`PlayerPedId`, coordonnées, santé, véhicule, contrôles, dessin, texte, NUI, entités locales avec `CreateObject` / `CreatePed` / `CreateVehicle`), `GetHashKey` / `joaat`, `json`, vecteurs (`vector2/3/4`, `vec`, `#v`, `.xy`, `type(v) == 'vector3'`), `GetConvar`, `LoadResourceFile`, `GetResourcePath`, KVP en mémoire par ressource (`SetResourceKvp*`, `GetResourceKvp*`, `DeleteResourceKvp`, `StartFindKvp` / `FindKvp`), `PerformHttpRequest` (pas de réseau : la réponse arrive avec le code 0), `Citizen.InvokeNative` (renvoie `nil`) et `Citizen.ResultAs*`, `msgpack`, `RegisterKeyMapping` (enregistré dans `joueur.side.keyMappings`).
+- Inclusions `@ressource/fichier.lua` du manifeste : un fournisseur (`emu:provide`) s'il existe, sinon le vrai fichier de cette ressource si elle a été lue avec `emu:loadResource`. Les scripts JavaScript et C# (`.js`, `.dll`) sont ignorés avec un avertissement.
 
 ### State bags
 
@@ -139,7 +140,9 @@ Attention à ce qu'un client peut écrire dans son propre sac : le serveur ne do
 - **interface** (client) : `lib.progressBar` / `lib.progressCircle` (bloquent le fil, renvoient `true` à la fin ou `false` si annulées : `p:cancelProgress()`, `lib.cancelProgress()`, ou mort sans `useWhileDead`), `lib.registerContext` / `showContext` / `hideContext`, `lib.inputDialog`, `lib.alertDialog`, `lib.showTextUI` / `hideTextUI` ; le test joue le rôle du joueur avec `p:selectMenu`, `p:answerInput`, `p:answerAlert` ;
 - **outils** : `lib.waitFor`, `lib.table` (`contains`, `matches`, `deepclone`, `merge`), `lib.getClosestPlayer` / `lib.getNearbyPlayers` (client et serveur), `lib.requestModel` et autres `lib.request*` (déjà chargés), `lib.addAce` / `lib.addPrincipal`.
 
-Non fournis : `lib.registerMenu` (menu liste), `lib.skillCheck`, `lib.getVehicleProperties`, `lib.class`, `lib.timer`, `lib.disableControls`…
+- **modules** : `lib.require` (et `require` global, comme ox_lib : `'a.b'` → `a/b.lua` ou `a/b/init.lua`, `@autre.chemin` pour une autre ressource, mis en cache), `lib.load`, `lib.loadJson`, `lib.class` (constructeur, `super`), `lib.checkDependency` (vrai seulement si la ressource tourne ; la version n'est pas comparée), `lib.versionCheck` (sans effet), `SetInterval` / `ClearInterval`.
+
+Non fournis : `lib.registerMenu` (menu liste), `lib.skillCheck`, `lib.getVehicleProperties`, `lib.timer`, `lib.disableControls`…
 
 ### Audit anti-triche (`emu:fuzz`)
 
@@ -214,7 +217,7 @@ local xPlayer = esx:xPlayer(p)    -- le xPlayer côté serveur
 ```
 
 - Connexion comme ESX sans multipersonnage : le client envoie `esx:onPlayerJoined` (~600 ms après son arrivée), le serveur crée le xPlayer, déclenche `esx:playerLoaded` côté serveur `(id, xPlayer, isNew)` puis l'envoie au client.
-- Serveur : `exports.es_extended:getSharedObject()`, `@es_extended/imports.lua`, `ESX.GetPlayerFromId`, `GetPlayerFromIdentifier`, `GetExtendedPlayers(clé, valeur)`, `GetNumPlayers`, `GetPlayers`, `GetIdentifier`, `RegisterServerCallback`, `TriggerClientCallback`, `RegisterUsableItem` / `UseItem`, `RegisterCommand` (avec arguments typés et ACE par groupe), `DoesJobExist`, `GetJobs`, `GetItems`, `GetItemLabel`, `TriggerClientEvent`, `Math`, `Table`, `GetConfig`.
+- Serveur : `exports.es_extended:getSharedObject()`, `@es_extended/imports.lua`, `@es_extended/locale.lua` (`Locales`, `Translate` / `_`, `TranslateCap` / `_U` selon `Config.Locale`), `ESX.GetPlayerFromId`, `GetPlayerFromIdentifier`, `GetExtendedPlayers(clé, valeur)`, `GetNumPlayers`, `GetPlayers`, `GetIdentifier`, `RegisterServerCallback`, `TriggerClientCallback`, `RegisterUsableItem` / `UseItem`, `RegisterCommand` (avec arguments typés et ACE par groupe), `DoesJobExist`, `GetJobs`, `GetItems`, `GetItemLabel`, `TriggerClientEvent`, `Math`, `Table`, `GetConfig`.
 - xPlayer recopié de `server/classes/player.lua` : `getIdentifier`, `getName`/`setName`, `getAccount(s)`, `getMoney`/`setMoney`/`addMoney`/`removeMoney`, `set/add/removeAccountMoney`, `getInventory`, `getInventoryItem`/`addInventoryItem`/`removeInventoryItem`/`setInventoryItem`, `canCarryItem`, `canSwapItem`, `getWeight`/`getMaxWeight`/`setMaxWeight`, `getJob`/`setJob`, `getGroup`/`setGroup`, `get`/`set`, `getMeta`/`setMeta`/`clearMeta`, `showNotification` (et variantes), `triggerEvent`, `getCoords`/`setCoords`, `kick`, `hasItem`, `getPlayTime`.
 - **Attention, comme la vraie 1.12.4 :** `removeAccountMoney` (et donc `removeMoney`) **ne vérifie pas le solde** : le compte peut devenir négatif et rien n'est renvoyé. Un montant `<= 0` lève une erreur (en mode ox : ignoré sans erreur). Vérifiez `getMoney()` vous-même avant de retirer.
 - Client : `ESX.GetPlayerData`, `ESX.IsPlayerLoaded`, `ESX.SetPlayerData`, `ESX.GetAccount`, `ESX.SearchInventory`, `ESX.ShowNotification` / `ShowHelpNotification` / `ShowAdvancedNotification` / `TextUI` (enregistrées dans `p.notifications`), `ESX.TriggerServerCallback`, `ESX.AwaitServerCallback` (comme la 1.12.4, son délai de 15 s ne se déclenche jamais), `ESX.RegisterClientCallback`. Les événements `esx:setAccountMoney`, `esx:setJob`, `esx:updatePlayerData`… tiennent `PlayerData` à jour.
@@ -287,7 +290,7 @@ local ok2, raison = target:select(bob, 'boutique:eau', { coords = { x = 1, y = 2
   ok     Bob déconnecté ne reçoit plus rien
   ok     aucune erreur
 
-fivem_emu 0.3.1 — t = 9.5 s virtuelles, 3 joueur(s)
+fivem_emu 0.3.2 — t = 9.5 s virtuelles, 3 joueur(s)
 erreurs : 0
 TriggerClientEvent vers tous (-1) : 3 fois
 joueur 1 (Alice, RTT 30 ms) : reçu 4 paquets / 0.1 Ko, envoyé 3 / 0.1 Ko, 60 dessins, 0 entités locales restantes
@@ -320,7 +323,7 @@ joueur 3 (Carol, RTT 90 ms) : reçu 5 paquets / 0.2 Ko, envoyé 2 / 0.1 Ko, 30 d
   ok     deux ventes enregistrées
   ok     aucune erreur
 
-fivem_emu 0.3.1 — t = 4.3 s virtuelles, 2 joueur(s)
+fivem_emu 0.3.2 — t = 4.3 s virtuelles, 2 joueur(s)
 erreurs : 0
 joueur 1 (Alice, RTT 40 ms) : reçu 16 paquets / 2.1 Ko, envoyé 5 / 0.3 Ko, 0 dessins, 0 entités locales restantes
 joueur 2 (Bob, RTT 150 ms) : reçu 3 paquets / 0.8 Ko, envoyé 2 / 0.0 Ko, 0 dessins, 0 entités locales restantes
@@ -346,7 +349,7 @@ L'événement `faille:don`, qui vérifie son montant (entier, positif, plafonné
 `lua5.4 tests/run.lua` lance les tests de l'émulateur et des mocks (ajoutez `-v` pour voir chaque vérification) ; il se termine par :
 
 ```
-269 vérifications : 269 réussies, 0 échouées
+286 vérifications : 286 réussies, 0 échouées
 ```
 
 ## Organisation du dépôt

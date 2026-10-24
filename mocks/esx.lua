@@ -1195,6 +1195,26 @@ return function(emu, opts)
         end
     end)
 
+    -- Inclusion '@es_extended/locale.lua' : Locales, Translate / TranslateCap (alias _ et _U), comme ESX
+    emu:provide('@es_extended/locale.lua', function(env)
+        env.Locales = env.Locales or {}
+        local function lookup(str, ...)
+            local lang = (rawget(env, 'Config') and env.Config.Locale) or 'en'
+            local t = env.Locales[lang] or env.Locales.en
+            local s = t and t[str]
+            if s == nil then return ('Translation [%s][%s] does not exist'):format(lang, tostring(str)) end
+            local ok, r = pcall(string.format, s, ...)
+            return ok and r or s
+        end
+        env.Translate = lookup
+        env.TranslateCap = function(str, ...)
+            local s = lookup(str, ...)
+            return (s:gsub('^%l', string.upper))
+        end
+        env._ = env.Translate
+        env._U = env.TranslateCap
+    end)
+
     -- Aides pour les tests
     function mock:xPlayer(player) return self.ESX.Players[type(player) == 'table' and player.id or tonumber(player)] end
     function mock:clientESX(player) return self.client[type(player) == 'table' and player.id or tonumber(player)] end
